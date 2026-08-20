@@ -2,6 +2,7 @@
 use "star/star.bx";
 use "bmx/burxt/bmx.bx";
 use "std/string.bx";
+use "std/json.bx";
 
 external function host_result(text: String) -> CInt;
 
@@ -18,35 +19,58 @@ function play(source: String) -> Int {
     }
 }
 
-// BMX: a document and a scope become a page, or a refusal with its offset.
+// BMX: a document and a JSON scope become a page, or a refusal with its offset.
 //
 // **`bmx_to_html` is the format's own renderer, in Burxt.** The first version of this playground
-// imported BMX's JavaScript reference implementation to do this. It worked, and it was the wrong
-// instinct: the Burxt implementation was already a dependency, already conformance-tested, and needs
-// no host at all.
+// imported BMX's JavaScript reference implementation. It worked, and it was the wrong instinct: the
+// Burxt implementation was already a dependency, already conformance-tested, and needs no host.
 //
-// **The scope is `name: value` lines rather than JSON, and that is a gap rather than a preference.**
-// `std/json.bx` can parse an object but cannot enumerate one — there is `json_at(v, name)` and no
-// `json_keys(v)` — so a Burxt program cannot walk a scope a reader typed. Lines are what Burxt can
-// read today, and they are arguably better for a playground; if `json_keys` arrives this can accept
-// either.
+// **And the scope is JSON, walked by matching on `Json` itself.** The version before this used
+// `name: value` lines and said `std/json.bx` could not enumerate an object — which was wrong, and
+// wrong in a way worth recording: `json_at`, `json_as_text` and `json_as_int` all take a name or
+// return a scalar, so the FUNCTION surface implies named access is the only door. The capability is in
+// the type. `Object([Field])` is public and `Field.name` reads straight off, so a program can walk a
+// structure whose shape it did not write. Reading a surface is not testing a surface.
 function render(source: String, scope: String) -> Int {
     region frame {
         let mutable binds: [Binding] = [];
-        let rows: [String] = string_split(scope, "\n");
-        let mutable i: Int = 0;
-        while i < len(rows) {
-            let row: String = string_trim(rows[i]);
-            if len(row) > 0 {
-                match string_split_once(row, ":") {
-                    None => { }
-                    Some(pair) => {
-                        let a: Int = push(binds, bmx_bind(string_trim(pair.0),
-                                                          string_trim(pair.1)));
+        let mutable failed: String = "";
+        if len(string_trim(scope)) > 0 {
+            match json_parse(scope) {
+                Error(e) => { failed = "The values pane is not valid JSON. " + e; }
+                Ok(v) => {
+                    match v {
+                        Object(fields) => {
+                            let mutable i: Int = 0;
+                            while i < len(fields) {
+                                match fields[i].value {
+                                    Text(t) => { let a: Int = push(binds, bmx_bind(fields[i].name, t)); }
+                                    Number(d) => {
+                                        let b: Int = push(binds, bmx_bind(fields[i].name, d));
+                                    }
+                                    Truth(yes) => {
+                                        let mutable said: String = "false";
+                                        if yes { said = "true"; }
+                                        let c: Int = push(binds, bmx_bind(fields[i].name, said));
+                                    }
+                                    // A slot holds one value, so a nested structure has no spelling here.
+                                    // Named rather than skipped: a binding silently missing is the thing
+                                    // BMX refuses documents for.
+                                    Object(o) => { failed = "`" + fields[i].name + "` is an object, and a slot takes one value."; }
+                                    List(l) => { failed = "`" + fields[i].name + "` is a list, and a slot takes one value."; }
+                                    Null => { let d2: Int = push(binds, bmx_bind(fields[i].name, "")); }
+                                }
+                                i += 1;
+                            }
+                        }
+                        Null => { } Truth(b2) => { } Number(n2) => { } Text(t2) => { } List(l2) => { }
                     }
                 }
             }
-            i += 1;
+        }
+        if len(failed) > 0 {
+            let told: Int = host_result(failed);
+            return 0;
         }
         let mutable out: String = "";
         match bmx_to_html(source, binds) {

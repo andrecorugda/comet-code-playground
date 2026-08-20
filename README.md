@@ -103,8 +103,9 @@ cd web && python3 -m http.server                  # then open http://localhost:8
 node tests/browser.mjs                            # checks it in a real browser
 ```
 
-**The values pane is `name: value` lines**, one per line — not JSON. Burxt can parse a JSON object but
-cannot yet enumerate one, so a scope typed by a reader could not be walked.
+**The values pane is JSON.** Strings, numbers, `true`/`false` and `null` become slot values; an object
+or a list is refused by name, because a slot holds one value and a binding that went missing quietly is
+what BMX exists to refuse.
 
 ## Licence
 
