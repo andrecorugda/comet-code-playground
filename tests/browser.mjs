@@ -100,8 +100,11 @@ try {
 let dom = outcome.html || '';
 if (outcome.mounted) dom += ' data-comet-ready="yes"';
 
-if (prove) dom = dom.replace('data-comet-ready="yes"', 'data-comet-ready="no"')
-                    .replace(/pure function demo/g, '');
+if (process.argv.includes('--show')) console.log('--- reported html ---\n' + dom.slice(0, 900) + '\n---\n');
+if (prove) {
+  dom = dom.replace('data-comet-ready="yes"', 'data-comet-ready="no"').replace(/A-1042/g, '');
+  outcome.modes = ['bmx'];
+}
 
 // ---- the accepting case, first and fatally --------------------------------------------------------
 //
@@ -109,13 +112,22 @@ if (prove) dom = dom.replace('data-comet-ready="yes"', 'data-comet-ready="no"')
 // reads as many defects rather than one. So this is the gate: nothing under it means anything.
 check(dom.includes('data-comet-ready="yes"'),
       'the playground mounts in Chrome',
-      `the page did not mount — everything below is the same defect: ${
-        (/MOUNT FAILED: [^<]*/.exec(dom) || ['(no reason in the DOM)'])[0]}`);
+      // **The page's own error, not a search of the DOM for one.** The first version looked for
+      // `MOUNT FAILED:` in the markup and printed "(no reason in the DOM)" when the page had reported
+      // a full stack trace — a harness withholding the answer it was handed.
+      `the page did not mount — everything below is the same defect:\n        ${
+        (outcome.error || '(the page reported no error)').split('\n').slice(0, 4).join('\n        ')}`);
 
-// star's generator answered, through wasm, in a browser: the default document became Burxt.
-check(/pure function demo/.test(dom),
-      'star generated a component from the document in the editor',
-      'the output pane holds no generated component — star\'s generator did not answer in the browser');
+// BMX rendered, by the format's own implementation, with the values pane as its bindings.
+check(/A-1042/.test(dom) && /data-comet-rendered/.test(dom),
+      'BMX rendered a page from the document and the values beside it',
+      'the result pane holds no rendered page — the default document did not render');
+
+// Every adapter that registered is a mode the reader can reach.
+check(Array.isArray(outcome.modes) && ['bmx', 'sbmx', 'burxt'].every((m) => outcome.modes.includes(m)),
+      `three languages registered through the public API (${(outcome.modes || []).join(', ')})`,
+      `the registry holds ${(outcome.modes || []).join(', ') || 'nothing'} — an adapter failed to register,`
+      + ' and a missing tab is indistinguishable from a broken one');
 
 console.log();
 if (prove) {

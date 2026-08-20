@@ -2,34 +2,46 @@
 use "std/string.bx";
 use "std/json.bx";
 
-class Model { source: String, result: String }
-enum Msg { Edited(String), Cleared }
+class Model { source: String, result: String, mode: String, bindings: String }
+enum Msg { Edited(String), Chose(String), Bound(String) }
 
 pure function update(msg: Msg, m: Model) -> Model {
     match msg {
-        Edited(text) => { return Model { source: text, result: m.result }; }
-        Cleared => { return Model { source: "", result: "" }; }
+        Edited(text) => { return Model { source: text, result: m.result, mode: m.mode, bindings: m.bindings }; }
+        Chose(id) => { return Model { source: m.source, result: "", mode: id, bindings: m.bindings }; }
+        Bound(text) => { return Model { source: m.source, result: m.result, mode: m.mode, bindings: text }; }
     }
 }
 
-// **The playground needs no command star does not already have.** `Send` carries a body to a URL and
-// the reply arrives as `value` — so "generate this document" is a POST the HOST fulfils locally by
-// calling star's own generator, compiled to wasm. Nothing here knows that; it asks for a URL.
+// **The playground needs no command star does not already have, and it does not know what a language
+// is.** `Send` carries a body to a URL and the reply arrives as `value`, so this asks `/run/<mode>` and
+// something outside answers. That indirection is the whole extension point: an adapter registered by
+// somebody who has never seen this file answers the same way star's generator does.
 pure function commands(msg: Msg, m: Model) -> [StarCmd] allocates {
     let mutable out: [StarCmd] = [];
     match msg {
         Edited(text) => {
-            let a: Int = push(out, StarCmd.Send(1, "/generate", text));
-            let b: Int = push(out, StarCmd.Store("comet.source", text));
+            let a: Int = push(out, StarCmd.Send(1, "/run/" + m.mode, text));
+            let b: Int = push(out, StarCmd.Store("comet." + m.mode, text));
         }
-        Cleared => { let c: Int = push(out, StarCmd.Store("comet.source", "")); }
+        Chose(id) => {
+            let c: Int = push(out, StarCmd.Send(1, "/run/" + id, m.source));
+        }
+        Bound(text) => {
+            // A binding change re-runs the same source: the scope is an input to the answer.
+            let d: Int = push(out, StarCmd.Send(2, "/bind/" + m.mode, text));
+            let e: Int = push(out, StarCmd.Send(1, "/run/" + m.mode, m.source));
+        }
     }
     return out;
 }
 
-// Tag 1 is the generator's answer — either the component it made or the refusal it gave.
+// Tag 1 is an adapter's answer — output, a rendered page, or a refusal. Tag 2 is the scope being
+// accepted, which produces nothing to show.
 pure function arrived(tag: Int, value: String, m: Model) -> Model {
-    if tag == 1 { return Model { source: m.source, result: value }; }
+    if tag == 1 {
+        return Model { source: m.source, result: value, mode: m.mode, bindings: m.bindings };
+    }
     return m;
 }
 
@@ -37,20 +49,28 @@ pure function to_text(m: Model) -> String allocates {
     let mutable f: [Field] = [];
     let a: Int = push(f, json_field("source", json_text(m.source)));
     let b: Int = push(f, json_field("result", json_text(m.result)));
+    let c: Int = push(f, json_field("mode", json_text(m.mode)));
+    let d: Int = push(f, json_field("bindings", json_text(m.bindings)));
     return json_render(json_object(f));
 }
 
+// **`from_text` FALLS BACK rather than failing**, which is what lets a host mount this with `{}` and
+// still get a usable page. The default mode is the one that needs nothing installed.
 function from_text(text: String) -> Model {
     let mutable source: String = "";
     let mutable result: String = "";
+    let mutable mode: String = "bmx";
+    let mutable bindings: String = "";
     match json_parse(text) {
         Error(e) => { }
         Ok(v) => {
             match json_at(v, "source") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { source = s; } } } }
             match json_at(v, "result") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { result = s; } } } }
+            match json_at(v, "mode") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { mode = s; } } } }
+            match json_at(v, "bindings") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { bindings = s; } } } }
         }
     }
-    return Model { source: source, result: result };
+    return Model { source: source, result: result, mode: mode, bindings: bindings };
 }
 ===
 
@@ -58,6 +78,18 @@ function from_text(text: String) -> Model {
 :!props:
 
 :div: class=comet
+:div: class=comet-bar
+:button: class=comet-tab on:click=Msg.Chose("bmx")
+bmx
+:!button:
+:button: class=comet-tab on:click=Msg.Chose("sbmx")
+sbmx
+:!button:
+:button: class=comet-tab on:click=Msg.Chose("burxt")
+burxt
+:!button:
+:!div:
+
 :textarea: class=comet-in on:input=Msg.Edited(value)
 {{ model.source }}
 :!textarea:
@@ -65,4 +97,8 @@ function from_text(text: String) -> Model {
 :pre: class=comet-out
 {{ model.result }}
 :!pre:
+
+:textarea: class=comet-scope on:input=Msg.Bound(value)
+{{ model.bindings }}
+:!textarea:
 :!div:

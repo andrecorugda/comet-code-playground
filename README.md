@@ -1,56 +1,109 @@
-# comet-code-playground
+# comet
 
-**One embeddable playground for Burxt, BMX and star-burxt.** Client-only: nothing leaves the page, so
-one person's edits cannot reach anybody else.
+**An embeddable code playground.** Drop it into a docs page and readers can edit code and see what it
+does, without leaving the page.
 
-## What it is, and what it is not yet
+Everything runs in the browser. Nothing is uploaded, nothing is shared, and there is no server to run —
+so one reader's edits can never reach another's, and you can put it on a static site.
 
-| | today |
-|---|---|
-| **star** | edit a `.sbmx`, see `BMX-Ennn` and `STAR-Ennn` refusals and the Burxt it generates |
-| **BMX** | rendered live by the format's own level-1 implementation, refusals included |
-| **Burxt** | not yet — see *Running things*, below |
+## Add it to a page
 
-## How it is built, and why that is the interesting part
+```html
+<div id="playground"></div>
 
-**The playground's own UI is a star component.** `Playground.sbmx` is compiled to wasm and driven by
-star's own `examples/app.js`, copied here byte-identical and never edited. That is deliberate: this
-repository installs star as a dependency the way anybody would, so it is a consumer rather than a
-test — and twenty minutes of being one found two bugs in `star-build` that no check inside star could
-see, because every check in star runs from star's own root.
+<script type="module">
+  import comet from 'https://your-site/comet/comet.js';
+  import 'https://your-site/comet/adapters/bmx.js';
 
-**It needed no new star feature.** `StarCmd.Send(tag, url, body)` already carries a body and delivers
-the reply as `value`, so *"generate this document"* is a POST the host fulfils locally by calling
-star's generator — compiled from star's published surface to wasm. `Store` and `Load` give the
-client-only persistence for free. The component asks for a URL; it does not know the answer never
-leaves the page.
-
-**BMX is not reimplemented.** `reference/bmx.js` exports `render(source, bindings)`, and `BOUNDARY.md`
-puts rendering at level 1 — so a conformant implementation already does it. The bindings pane *is* the
-`bindings` argument. An unbound slot shows **`BMX-R002`** with its offset rather than a blank, and a
-block shows **`BMX-R003`**, because both are correct behaviour: a page rendering a hole where a value
-was missing is the precise thing BMX exists to refuse.
-
-**A star page carries no executable markup.** Handlers reach the DOM as `data-star-h="0"` indices,
-never inline JavaScript. A playground for most frameworks is an arbitrary-code-execution surface;
-this one is not, and that comes from star's design rather than from sandboxing.
-
-## Running things
-
-Checking works client-side. *Running* a Burxt program in a browser does not, and the reason is
-specific: the self-hosted compiler emits LLVM IR **text**, so the pipeline is `emit.bx` → `llc` →
-object → link. Two native tools stand in the way and the linker is the smaller one, so porting a
-linker buys nothing. The options are a wasm backend in `emit.bx`, an interpreter — which would put a
-VM inside the product that teaches there is no VM — or precompiling curated examples at deploy.
-
-## Building it
-
-```sh
-burxt fetch                                    # star and bmx, at the tags in burxt.lock
-star-build Playground.sbmx playground build    # the UI component -> wasm
-node tests/browser.mjs                         # and it mounts in a real browser
-node tests/browser.mjs --prove-it              # which must FAIL, and exits 0 when it does
+  comet.mount({
+    root: document.querySelector('#playground'),
+    source: '# Receipt {{ reference }}\n\nThank you, {{ name }}.\n',
+    bindings: '{ "reference": "A-1042", "name": "Ada" }',
+  });
+</script>
 ```
 
-star's three commands come from its own checkout — see star's `docs/install.md` — and must be on
-`PATH`.
+That is the whole integration. Copy the `web/` folder next to your pages and point the import at it.
+
+## What a reader gets
+
+- **An editor**, with the document you seeded it with.
+- **A result pane** — a rendered preview, generated code, or the exact error, depending on the language.
+- **A values pane**, for languages that substitute values into a document.
+- **Tabs**, one per language you imported.
+- **Their work kept** between visits, in their own browser.
+
+Errors are shown as the language reports them, with the position included. A playground that renders a
+blank where something was wrong teaches the wrong lesson, so nothing is swallowed.
+
+## Languages
+
+| tab | what it does |
+|---|---|
+| **BMX** | renders the document live, with the values pane supplying the slots |
+| **star-burxt** | checks a `.sbmx` component and shows the code it generates |
+| **Burxt** | not checked in the browser yet; the tab says what it is waiting on |
+
+Import only the ones you want — each is a separate file, and an unimported language has no tab and
+costs nothing to download.
+
+## Add your own language
+
+An adapter is one function. It receives what the reader typed and returns what to show.
+
+```js
+import comet from './comet.js';
+
+comet.register({
+  id: 'json',
+  label: 'JSON',
+  async run({ source, bindings }) {
+    if (!source.trim()) return { output: '' };
+    try {
+      return { output: JSON.stringify(JSON.parse(source), null, 2) };
+    } catch (e) {
+      return { error: e.message };
+    }
+  },
+});
+```
+
+Return one of three things:
+
+| | shown as |
+|---|---|
+| `{ output }` | text — generated code, formatted output, a report |
+| `{ html }` | a rendered preview |
+| `{ error }` | a refusal, exactly as you wrote it |
+
+`run` may be `async`, so a language whose checker is a WebAssembly module can load it on first use.
+If `run` throws, the reader sees the message rather than a blank pane.
+
+`{ html }` is inserted as markup, so an adapter returning it is responsible for escaping the values it
+substitutes. Anything a reader types reaches `output` and `error` as text and is never treated as
+markup.
+
+## Options
+
+| | |
+|---|---|
+| `root` | the element to mount into — required |
+| `source` | the document the editor starts with |
+| `bindings` | the values pane's starting contents |
+| `mode` | which tab opens first; defaults to the first language imported |
+| `base` | where the playground's files live, if not `./` |
+
+## Running it here
+
+```sh
+cd web && python3 -m http.server        # then open http://localhost:8000
+node tests/browser.mjs                  # checks it in a real browser
+```
+
+## Licence
+
+MIT.
+
+---
+
+Powered by [star-burxt](https://star.burxt-lang.org).
