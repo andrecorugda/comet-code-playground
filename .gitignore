@@ -7,3 +7,7 @@ build/
 
 # `star-check` writes one of these beside every document it checks.
 *.check.bx
+
+# Andre's golden rules, and how this work is run. Local on purpose — the same file in every
+# repository in the family.
+.claude/
