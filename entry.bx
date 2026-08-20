@@ -1,0 +1,18 @@
+// The generator, as the playground needs it: text in, a refusal or a component out.
+use "star/star.bx";
+
+external function host_result(text: String) -> CInt;
+
+// A String may not outlive its region, so the host takes the bytes INSIDE it — the same shape every
+// generated component's `_render` uses, and for the same reason.
+function play(source: String) -> Int {
+    region frame {
+        let mutable out: String = "";
+        match star_generate(source, "demo", []) {
+            Error(message) => { out = message; }
+            Ok(built) => { out = star_source_of(built, "demo"); }
+        }
+        let sent: Int = host_result(out);
+        return len(out);
+    }
+}

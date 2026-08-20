@@ -1,0 +1,9 @@
+# `burxt fetch` writes these; the LOCKFILE is committed, not the checkout.
+.burxt/
+
+# Build output. `web/*.wasm` is generated too, but committed on purpose — the site serves it,
+# and a page that needs a build step to be viewable is a page nobody views.
+build/
+
+# `star-check` writes one of these beside every document it checks.
+*.check.bx

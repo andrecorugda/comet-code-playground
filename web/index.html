@@ -1,0 +1,58 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>comet-code-playground</title>
+<style>
+  :root { color-scheme: light dark; }
+  body { font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 1.5rem; }
+  .comet { display: grid; grid-template-columns: 1fr 1fr; gap: 1rem; min-height: 60vh; }
+  .comet-in, .comet-out {
+    font: 13px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
+    border: 1px solid color-mix(in oklab, currentColor 25%, transparent);
+    border-radius: 6px; padding: .75rem; margin: 0; white-space: pre-wrap; overflow: auto;
+  }
+  .comet-in { resize: none; background: transparent; color: inherit; }
+  h1 { font-size: 1.1rem; margin: 0 0 1rem; }
+</style>
+
+<h1>comet-code-playground</h1>
+<div id="root">loading…</div>
+
+<script type="module">
+  // **The page reports what happened; the harness does not guess when to look.**
+  //
+  // `--dump-dom` dumps after the load event, and a module with top-level `await` is still running
+  // then — so a DOM snapshot catches the page mid-mount and a passing assertion would be luck.
+  // `--virtual-time-budget` hangs once real network is involved. So the page POSTs its own outcome to
+  // the harness's server, which resolves the moment it arrives: no polling, no sleeping, no timing
+  // assumption anywhere. `play.js` only intercepts its own paths, so this reaches the real server.
+  const report = (outcome) => {
+    try {
+      return navigator.sendBeacon('/report', JSON.stringify(outcome))
+        || fetch('/report', { method: 'POST', body: JSON.stringify(outcome) });
+    } catch (e) { /* nothing left to report with */ }
+  };
+
+  try {
+    const { start } = await import('./play.js');
+    const app = await start({ root: document.querySelector('#root'), base: './' });
+
+    // **Driven through star's OWN event path, not around it.** Nothing generates until something is
+    // edited — `commands` fires on `Msg.Edited` and the component starts empty, which is correct and is
+    // why the first version of this check failed. So dispatch a real `input` event: it goes through the
+    // delegated listener `app.js` installed, becomes `Msg.Edited(value)`, produces `StarCmd.Send`, is
+    // fulfilled locally, and comes back through `arrived`. A test that poked the state directly would
+    // skip every part of that.
+    const box = document.querySelector('.comet-in');
+    if (box) {
+      box.value = ':props: n: Int\n:!props:\n\n# Count is {{ to_string(n) }}\n';
+      box.dispatchEvent(new InputEvent('input', { bubbles: true }));
+    }
+    // One turn for the command to be performed and the reply to repaint.
+    await new Promise((r) => setTimeout(r, 600));
+    document.body.dataset.cometReady = 'yes';
+    report({ mounted: true, html: app.html || document.querySelector('#root').innerHTML });
+  } catch (e) {
+    document.querySelector('#root').textContent = 'MOUNT FAILED: ' + e.message;
+    report({ mounted: false, error: String(e && e.stack || e) });
+  }
+</script>

@@ -1,0 +1,68 @@
+===bx
+use "std/string.bx";
+use "std/json.bx";
+
+class Model { source: String, result: String }
+enum Msg { Edited(String), Cleared }
+
+pure function update(msg: Msg, m: Model) -> Model {
+    match msg {
+        Edited(text) => { return Model { source: text, result: m.result }; }
+        Cleared => { return Model { source: "", result: "" }; }
+    }
+}
+
+// **The playground needs no command star does not already have.** `Send` carries a body to a URL and
+// the reply arrives as `value` — so "generate this document" is a POST the HOST fulfils locally by
+// calling star's own generator, compiled to wasm. Nothing here knows that; it asks for a URL.
+pure function commands(msg: Msg, m: Model) -> [StarCmd] allocates {
+    let mutable out: [StarCmd] = [];
+    match msg {
+        Edited(text) => {
+            let a: Int = push(out, StarCmd.Send(1, "/generate", text));
+            let b: Int = push(out, StarCmd.Store("comet.source", text));
+        }
+        Cleared => { let c: Int = push(out, StarCmd.Store("comet.source", "")); }
+    }
+    return out;
+}
+
+// Tag 1 is the generator's answer — either the component it made or the refusal it gave.
+pure function arrived(tag: Int, value: String, m: Model) -> Model {
+    if tag == 1 { return Model { source: m.source, result: value }; }
+    return m;
+}
+
+pure function to_text(m: Model) -> String allocates {
+    let mutable f: [Field] = [];
+    let a: Int = push(f, json_field("source", json_text(m.source)));
+    let b: Int = push(f, json_field("result", json_text(m.result)));
+    return json_render(json_object(f));
+}
+
+function from_text(text: String) -> Model {
+    let mutable source: String = "";
+    let mutable result: String = "";
+    match json_parse(text) {
+        Error(e) => { }
+        Ok(v) => {
+            match json_at(v, "source") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { source = s; } } } }
+            match json_at(v, "result") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { result = s; } } } }
+        }
+    }
+    return Model { source: source, result: result };
+}
+===
+
+:props: model: Model
+:!props:
+
+:div: class=comet
+:textarea: class=comet-in on:input=Msg.Edited(value)
+{{ model.source }}
+:!textarea:
+
+:pre: class=comet-out
+{{ model.result }}
+:!pre:
+:!div:
