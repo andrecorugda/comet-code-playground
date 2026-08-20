@@ -68,7 +68,7 @@
       base: './',
       mode: 'bmx',
       source: '# Receipt {{ reference }}\n\nThank you, {{ name }}. Your total is **{{ total }}**.\n',
-      bindings: '{\n  "reference": "A-1042",\n  "name": "Ada",\n  "total": "£49.00"\n}',
+      bindings: 'reference: A-1042\nname: Ada\ntotal: £49.00',
     });
 
     // `mount` seeds the editor and runs once, so there is nothing for this page to drive.

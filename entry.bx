@@ -1,16 +1,57 @@
-// The generator, as the playground needs it: text in, a refusal or a component out.
+// Everything the playground computes, in Burxt. No JavaScript decides anything here.
 use "star/star.bx";
+use "bmx/burxt/bmx.bx";
+use "std/string.bx";
 
 external function host_result(text: String) -> CInt;
 
-// A String may not outlive its region, so the host takes the bytes INSIDE it — the same shape every
-// generated component's `_render` uses, and for the same reason.
+// star: a document becomes a component, or a refusal naming what is wrong.
 function play(source: String) -> Int {
     region frame {
         let mutable out: String = "";
         match star_generate(source, "demo", []) {
             Error(message) => { out = message; }
             Ok(built) => { out = star_source_of(built, "demo"); }
+        }
+        let sent: Int = host_result(out);
+        return len(out);
+    }
+}
+
+// BMX: a document and a scope become a page, or a refusal with its offset.
+//
+// **`bmx_to_html` is the format's own renderer, in Burxt.** The first version of this playground
+// imported BMX's JavaScript reference implementation to do this. It worked, and it was the wrong
+// instinct: the Burxt implementation was already a dependency, already conformance-tested, and needs
+// no host at all.
+//
+// **The scope is `name: value` lines rather than JSON, and that is a gap rather than a preference.**
+// `std/json.bx` can parse an object but cannot enumerate one — there is `json_at(v, name)` and no
+// `json_keys(v)` — so a Burxt program cannot walk a scope a reader typed. Lines are what Burxt can
+// read today, and they are arguably better for a playground; if `json_keys` arrives this can accept
+// either.
+function render(source: String, scope: String) -> Int {
+    region frame {
+        let mutable binds: [Binding] = [];
+        let rows: [String] = string_split(scope, "\n");
+        let mutable i: Int = 0;
+        while i < len(rows) {
+            let row: String = string_trim(rows[i]);
+            if len(row) > 0 {
+                match string_split_once(row, ":") {
+                    None => { }
+                    Some(pair) => {
+                        let a: Int = push(binds, bmx_bind(string_trim(pair.0),
+                                                          string_trim(pair.1)));
+                    }
+                }
+            }
+            i += 1;
+        }
+        let mutable out: String = "";
+        match bmx_to_html(source, binds) {
+            Error(message) => { out = message; }
+            Ok(html) => { out = html; }
         }
         let sent: Int = host_result(out);
         return len(out);

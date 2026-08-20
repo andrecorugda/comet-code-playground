@@ -96,9 +96,15 @@ markup.
 ## Running it here
 
 ```sh
-cd web && python3 -m http.server        # then open http://localhost:8000
-node tests/browser.mjs                  # checks it in a real browser
+burxt fetch                                       # star and BMX, at the tags in burxt.lock
+star-build Playground.sbmx playground build       # the interface
+burxt build entry.bx --target wasm32-unknown-unknown -o build/entry.o   # the engine
+cd web && python3 -m http.server                  # then open http://localhost:8000
+node tests/browser.mjs                            # checks it in a real browser
 ```
+
+**The values pane is `name: value` lines**, one per line — not JSON. Burxt can parse a JSON object but
+cannot yet enumerate one, so a scope typed by a reader could not be walked.
 
 ## Licence
 
