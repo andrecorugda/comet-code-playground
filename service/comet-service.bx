@@ -1,0 +1,430 @@
+// comet's control plane: declarations in, runs out.
+//
+//     burxt build service/comet-service.bx -o comet-service
+//     ./comet-service --serve 8080
+//     ./comet-service --run <run-directory>     # one run; spawned by the service, not for hand use
+//
+//     GET  /languages          the environments this host has provisioned
+//     POST /provision          {"env":"burxt"}                 -> {"reference":..., "digest":...}
+//     POST /run                {"env":"burxt","source":"..."}  -> {"run":"<id>"}
+//     GET  /run/<id>?from=N    the run so far, from byte N of each stream
+//
+// **Why a run is spawned rather than awaited.** `http_serve_one` is one request at a time, and a run
+// takes hundreds of milliseconds at best and its whole deadline at worst. Answering `POST /run`
+// synchronously would hold every other visitor behind the slowest program on the page. So the service
+// writes the run's inputs to a directory, spawns THIS SAME BINARY with `--run` on it, and answers with
+// an id immediately; `GET /run/<id>` reads whatever has been written since.
+//
+// That is the same self-spawn star's gallery uses to serve pages while driving a browser, and it is
+// forced by the same thing: a blocking accept loop cannot also be doing the work.
+//
+// **And polling rather than streaming is measured, not lazy.** Burxt's `http.bx` has no chunked transfer
+// encoding in either direction — `http_render_response` builds status, headers and body into one string
+// and writes it once — so a console cannot be streamed from here today. `?from=N` returns what followed
+// byte N, which also survives a dropped connection where a stream does not. A named gap report goes to
+// the language session with this console as its concrete caller.
+use "std/files.bx";
+use "std/string.bx";
+use "std/json.bx";
+use "std/http.bx";
+use "std/net.bx";
+use "std/os.bx";
+use "std/hash.bx";
+use "sandbox.bx";
+
+const ENVIRONMENTS: String = "environments";
+const RUNS: String = "runs";
+
+class Service { root: String }
+
+pure function json_escaped(text: String) -> String allocates {
+    let mutable out: String = "";
+    let mutable i: Int = 0;
+    while i < len(text) {
+        let c: String = substring(text, i, 1);
+        let b: Int = byte_at(text, i);
+        if c == "\"" {
+            out = out + "\\\"";
+        } else {
+            if c == "\\" {
+                out = out + "\\\\";
+            } else {
+                if b < 32 {
+                    // **Every control byte, not the seven that look obvious.** RFC 8259 §7 forbids a raw
+                    // control character in a string, and a visitor's editor is exactly where a stray
+                    // 0x01 arrives. Burxt's own `json_render` shipped this bug until 1.7.0.
+                    if b == 10 {
+                        out = out + "\\n";
+                    } else {
+                        if b == 13 {
+                            out = out + "\\r";
+                        } else {
+                            if b == 9 {
+                                out = out + "\\t";
+                            } else {
+                                out = out + "\\u00" + hash_hex_int(b, 2);
+                            }
+                        }
+                    }
+                } else {
+                    out = out + c;
+                }
+            }
+        }
+        i += 1;
+    }
+    return out;
+}
+
+pure function quoted_json(text: String) -> String allocates {
+    return "\"" + json_escaped(text) + "\"";
+}
+
+// `field_of` and `text_of` come from sandbox.bx, which this imports — one definition, not two.
+
+// **An environment id is a filename, so it is checked rather than trusted.** `../../etc/passwd` as an
+// env name would otherwise read a declaration anywhere on the disk.
+pure function safe_id(id: String) -> Bool {
+    if len(id) == 0 || len(id) > 64 {
+        return false;
+    }
+    let mutable i: Int = 0;
+    while i < len(id) {
+        let c: String = substring(id, i, 1);
+        if string_find("abcdefghijklmnopqrstuvwxyz0123456789-_", c) < 0 {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+// **A run id and an environment name are not the same shape, and conflating them cost a debugging
+// round.** An environment name is a filename an owner types, so it stays lowercase. A run id is
+// generated here by `mktemp`, which produces mixed case — `DsT4Zb2g` — and validating it with the
+// environment predicate rejected every id this service had just issued. The endpoint answered "that is
+// not a run id" about an id it invented four milliseconds earlier.
+pure function safe_run_id(id: String) -> Bool {
+    if len(id) == 0 || len(id) > 64 {
+        return false;
+    }
+    let mutable i: Int = 0;
+    while i < len(id) {
+        let c: String = substring(id, i, 1);
+        if string_find("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_", c) < 0 {
+            return false;
+        }
+        i += 1;
+    }
+    return true;
+}
+
+pure function answer(status: Int, body: String) -> HttpResponse allocates {
+    let mutable headers: [HttpHeader] = [];
+    let a: Int = push(headers, HttpHeader { name: "content-type", value: "application/json" });
+    // The embed is served from another origin by design, so the API says so.
+    let b: Int = push(headers, HttpHeader { name: "access-control-allow-origin", value: "*" });
+    let c: Int = push(headers, HttpHeader { name: "cache-control", value: "no-store" });
+    return HttpResponse { status: status, headers: headers, body: body };
+}
+
+pure function refusal(status: Int, why: String) -> HttpResponse allocates {
+    return answer(status, "\{" + quoted_json("error") + ":" + quoted_json(why) + "\}");
+}
+
+// `?from=N`, or 0.
+pure function from_of(query: String) -> Int {
+    let marker: String = "from=";
+    let at: Int = string_find(query, marker);
+    if at < 0 {
+        return 0;
+    }
+    let rest: String = substring(query, at + len(marker), len(query) - at - len(marker));
+    let mutable stop: Int = 0;
+    while stop < len(rest) && string_find("0123456789", substring(rest, stop, 1)) >= 0 {
+        stop += 1;
+    }
+    return string_to_int(substring(rest, 0, stop), 0);
+}
+
+// Bytes of `text` from `at` onward, clamped — because `substring` REFUSES a length past the end where a
+// caller would expect a truncation, and `from` arrives from a query string.
+pure function since(text: String, at: Int) -> String allocates {
+    if at >= len(text) {
+        return "";
+    }
+    let mutable start: Int = at;
+    if start < 0 {
+        start = 0;
+    }
+    return substring(text, start, len(text) - start);
+}
+
+const STATE: String = "state";
+
+// What `/provision` recorded, so `/run` does not have to discover it. **`/run` must be fast**: it is on
+// the path of every keystroke-triggered execution, and discovering an environment means asking Docker or
+// Vercel. So provisioning writes the reference down once and running reads it.
+pure function state_path(env: String) -> String allocates {
+    return STATE + "/" + env + ".json";
+}
+
+function provisioned_reference(env: String) -> String allocates touches files, commands {
+    let path: String = state_path(env);
+    if !file_exists(path) {
+        return "";
+    }
+    match json_parse(file_read(path)) {
+        Ok(value) => { return text_of(field_of(value, "reference")); }
+        Error(bad) => { return ""; }
+    }
+}
+
+// ---- the runner: one run, then write what happened ----------------------------------------------
+//
+// Spawned by `/run` as a separate process. **`result.json` is written LAST and atomically**, by writing
+// a temporary file and renaming it: a reader that sees the file sees a complete one, and `GET /run/<id>`
+// treats its absence as "still running". A half-written result read as a finished run would report a
+// truncated program as a successful one.
+function perform(dir: String) -> Int touches files, commands, input {
+    let env: String = string_trim(file_read(dir + "/env"));
+    let source: String = file_read(dir + "/source");
+    let reference: String = string_trim(file_read(dir + "/reference"));
+    let d: Declaration = read_declaration(ENVIRONMENTS + "/" + env + ".json");
+    let outcome: Outcome = run_source(d, reference, source);
+
+    let mutable body: String = "\{";
+    body = body + quoted_json("status") + ":" + quoted_json("done") + ",";
+    body = body + quoted_json("exit") + ":" + to_string(outcome.exit) + ",";
+    body = body + quoted_json("ms") + ":" + to_string(outcome.ms) + ",";
+    body = body + quoted_json("timed_out") + ":";
+    if outcome.timed_out {
+        body = body + "true,";
+    } else {
+        body = body + "false,";
+    }
+    body = body + quoted_json("stdout") + ":" + quoted_json(outcome.stdout) + ",";
+    body = body + quoted_json("stderr") + ":" + quoted_json(outcome.stderr) + ",";
+    body = body + quoted_json("why") + ":" + quoted_json(outcome.why);
+    body = body + "\}";
+
+    let temp: String = dir + "/result.partial";
+    let wrote: Int = file_write(temp, body);
+    if wrote < 0 {
+        return 1;
+    }
+    let moved: Capture = os_capture_status("mv " + quoted(temp) + " " + quoted(dir + "/result.json"));
+    return moved.code;
+}
+
+// ---- the endpoints ------------------------------------------------------------------------------
+
+implement Handler for Service {
+    function (self) handle(request: HttpRequest) -> HttpResponse
+            allocates touches files, commands, input {
+        // The embed lives on another origin, so a browser asks first.
+        if request.method == "OPTIONS" {
+            let mutable headers: [HttpHeader] = [];
+            let a: Int = push(headers, HttpHeader { name: "access-control-allow-origin", value: "*" });
+            let b: Int = push(headers,
+                HttpHeader { name: "access-control-allow-headers", value: "content-type" });
+            let c: Int = push(headers,
+                HttpHeader { name: "access-control-allow-methods", value: "GET, POST, OPTIONS" });
+            return HttpResponse { status: 204, headers: headers, body: "" };
+        }
+
+        if request.path == "/languages" && request.method == "GET" {
+            let listing: Capture = os_capture_status(
+                "ls " + ENVIRONMENTS + "/*.json 2>/dev/null");
+            let files: [String] = string_lines(listing.output);
+            let mutable body: String = "\{" + quoted_json("languages") + ":[";
+            let mutable shown: Int = 0;
+            let mutable i: Int = 0;
+            while i < len(files) {
+                let path: String = string_trim(files[i]);
+                if len(path) > 0 {
+                    let d: Declaration = read_declaration(path);
+                    if d.ok {
+                        if shown > 0 {
+                            body = body + ",";
+                        }
+                        let reference: String = provisioned_reference(d.id);
+                        body = body + "\{" + quoted_json("id") + ":" + quoted_json(d.id) + ","
+                            + quoted_json("label") + ":" + quoted_json(d.label) + ","
+                            + quoted_json("file") + ":" + quoted_json(d.file) + ","
+                            + quoted_json("timeout_ms") + ":" + to_string(d.timeout_ms) + ","
+                            + quoted_json("ready") + ":";
+                        if len(reference) > 0 {
+                            body = body + "true";
+                        } else {
+                            body = body + "false";
+                        }
+                        body = body + "\}";
+                        shown += 1;
+                    }
+                }
+                i += 1;
+            }
+            return answer(200, body + "]," + quoted_json("backend") + ":"
+                + quoted_json(backend()) + "\}");
+        }
+
+        if request.path == "/provision" && request.method == "POST" {
+            let mutable env: String = "";
+            match json_parse(request.body) {
+                Ok(value) => { env = text_of(field_of(value, "env")); }
+                Error(bad) => { return refusal(400, "the body is not JSON: " + bad); }
+            }
+            if !safe_id(env) {
+                return refusal(400, "`env` must be a short lowercase name; `" + env + "` is not one");
+            }
+            let d: Declaration = read_declaration(ENVIRONMENTS + "/" + env + ".json");
+            if !d.ok {
+                return refusal(404, d.why);
+            }
+            match file_temp_directory("comet-provision") {
+                None => { return refusal(500, "cannot make a working directory"); }
+                Some(scratch) => {
+                    let done: Provisioned = provision(d, scratch);
+                    if !done.ok {
+                        return refusal(500, done.why);
+                    }
+                    let made: Capture = os_capture_status("mkdir -p " + quoted(STATE));
+                    let noted: String = "\{" + quoted_json("reference") + ":"
+                        + quoted_json(done.reference) + "," + quoted_json("digest") + ":"
+                        + quoted_json(done.digest) + "\}";
+                    let wrote: Int = file_write(state_path(env), noted);
+                    if wrote < 0 {
+                        return refusal(500, "provisioned, but the reference could not be recorded");
+                    }
+                    return answer(200, noted);
+                }
+            }
+        }
+
+        if request.path == "/run" && request.method == "POST" {
+            let mutable env: String = "";
+            let mutable source: String = "";
+            match json_parse(request.body) {
+                Ok(value) => {
+                    env = text_of(field_of(value, "env"));
+                    source = text_of(field_of(value, "source"));
+                }
+                Error(bad) => { return refusal(400, "the body is not JSON: " + bad); }
+            }
+            if !safe_id(env) {
+                return refusal(400, "`env` must be a short lowercase name; `" + env + "` is not one");
+            }
+            let reference: String = provisioned_reference(env);
+            if len(reference) == 0 {
+                // **Refused rather than provisioned here.** Building an environment takes minutes and
+                // this endpoint is on the path of a keystroke; a `/run` that silently started a build
+                // would look like a hung playground to every visitor on the page.
+                return refusal(409, "`" + env + "` is not provisioned on this host — POST /provision"
+                    + " first. Building takes minutes, so it is not something a run will do for you");
+            }
+            let made: Capture = os_capture_status("mkdir -p " + quoted(RUNS));
+            let dir_made: Capture = os_capture_status("mktemp -d " + quoted(RUNS + "/XXXXXXXX"));
+            let dir: String = string_trim(dir_made.output);
+            if dir_made.code != 0 || len(dir) == 0 {
+                return refusal(500, "cannot make a directory for this run");
+            }
+            let w1: Int = file_write(dir + "/env", env);
+            let w2: Int = file_write(dir + "/source", source);
+            let w3: Int = file_write(dir + "/reference", reference);
+            if w1 < 0 || w2 < 0 || w3 < 0 {
+                return refusal(500, "cannot stage this run");
+            }
+            // This same binary, on that directory, detached. See the header on why it is not awaited.
+            let spawned: Capture = os_capture_status(
+                "./comet-service --run " + quoted(dir) + " >/dev/null 2>&1 & echo $!");
+            let slash: Int = string_rfind(dir, "/");
+            let id: String = substring(dir, slash + 1, len(dir) - slash - 1);
+            return answer(202, "\{" + quoted_json("run") + ":" + quoted_json(id) + ","
+                + quoted_json("status") + ":" + quoted_json("running") + "\}");
+        }
+
+        if string_starts_with(request.path, "/run/") && request.method == "GET" {
+            let id: String = substring(request.path, 5, len(request.path) - 5);
+            if !safe_run_id(id) {
+                return refusal(400, "that is not a run id");
+            }
+            let dir: String = RUNS + "/" + id;
+            if !file_exists(dir + "/env") {
+                return refusal(404, "no run " + id);
+            }
+            let from: Int = from_of(request.query);
+            if !file_exists(dir + "/result.json") {
+                return answer(200, "\{" + quoted_json("status") + ":" + quoted_json("running") + ","
+                    + quoted_json("stdout") + ":" + quoted_json("") + ","
+                    + quoted_json("stderr") + ":" + quoted_json("") + "\}");
+            }
+            // The whole result, then the two streams cut back to what follows byte `from`. Rebuilding
+            // the object is what makes `?from=` mean the same thing on every poll.
+            match json_parse(file_read(dir + "/result.json")) {
+                Ok(value) => {
+                    let out: String = since(text_of(field_of(value, "stdout")), from);
+                    let err: String = since(text_of(field_of(value, "stderr")), from);
+                    let mutable body: String = "\{";
+                    body = body + quoted_json("status") + ":" + quoted_json("done") + ",";
+                    body = body + quoted_json("exit") + ":"
+                        + to_string(int_of(field_of(value, "exit"), 0 - 1)) + ",";
+                    body = body + quoted_json("ms") + ":"
+                        + to_string(int_of(field_of(value, "ms"), 0)) + ",";
+                    body = body + quoted_json("from") + ":" + to_string(from) + ",";
+                    body = body + quoted_json("stdout") + ":" + quoted_json(out) + ",";
+                    body = body + quoted_json("stderr") + ":" + quoted_json(err) + ",";
+                    body = body + quoted_json("why") + ":"
+                        + quoted_json(text_of(field_of(value, "why")));
+                    return answer(200, body + "\}");
+                }
+                Error(bad) => {
+                    return refusal(500, "this run's result is unreadable: " + bad);
+                }
+            }
+        }
+
+        return refusal(404, "no such endpoint: " + request.method + " " + request.path);
+    }
+}
+
+// ---- the two modes ------------------------------------------------------------------------------
+
+let mutable args: [String] = [];
+let mutable a: Int = 1;
+while a < os_arg_count() {
+    let x: Int = push(args, os_arg(a));
+    a += 1;
+}
+
+if len(args) >= 2 && args[0] == "--run" {
+    exit(perform(args[1]));
+}
+
+if len(args) >= 1 && args[0] == "--serve" {
+    let mutable port: Int = 8080;
+    if len(args) >= 2 {
+        port = string_to_int(args[1], 8080);
+    }
+    let which: String = backend();
+    if len(which) == 0 {
+        print_error("comet-service: no sandbox backend. Set VERCEL_AUTH_TOKEN with the vercel CLI on"
+            + " PATH, or make docker usable. **Refusing rather than starting**, because a service that"
+            + " accepted runs it could not sandbox would answer every one of them with an error a"
+            + " visitor would read as their own mistake.");
+        exit(2);
+    }
+    print("comet-service on http://127.0.0.1:" + to_string(port) + ", backend " + which);
+    let site: Service = Service { root: "." };
+    let handler: dynamic Handler = site;
+    match http_serve(port, handler, 4194304) {
+        None => {
+            print_error("cannot listen on " + to_string(port));
+            exit(1);
+        }
+        Some(served) => { print("served " + to_string(served) + " request(s)"); }
+    }
+}
+
+print_error("usage: comet-service --serve <port>");
+exit(2);

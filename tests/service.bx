@@ -14,6 +14,7 @@
 use "std/files.bx";
 use "std/string.bx";
 use "std/os.bx";
+use "std/http.bx";
 use "../service/sandbox.bx";
 
 class Tally { ran: Int, broken: Int }
@@ -173,6 +174,140 @@ let x10: Int = check(tally,
     "a run cannot see what an earlier run left behind",
     "the writing run said " + first_line(leaving.stdout) + " and the looking run said "
         + first_line(looking.stdout));
+
+// ---- the service, over a real socket ------------------------------------------------------------
+//
+// **The client is Burxt talking to Burxt, and `127.0.0.1` is why it can be.** `http_get` takes four
+// address octets because a Burxt program cannot resolve a hostname — which rules out calling anything on
+// the internet and rules IN calling a service on the loopback, where the octets are the address.
+//
+// The service is spawned detached because `http_serve` blocks on accept; the same arrangement the
+// browser harness uses, and forced by the same thing.
+let port: Int = 8231;
+let spawned: Capture = os_capture_status(
+    "./comet-service --serve " + to_string(port) + " >/dev/null 2>&1 & echo $!");
+let service_pid: String = string_trim(spawned.output);
+
+let mutable up: Bool = false;
+let mutable tries: Int = 0;
+while tries < 40 && !up {
+    match http_get(127, 0, 0, 1, port, "127.0.0.1", "/languages") {
+        Ok(reply) => { up = reply.status == 200; }
+        Error(why) => { up = false; }
+    }
+    if !up {
+        let waited: Capture = os_capture_status("sleep 0.1");
+    }
+    tries += 1;
+}
+let x11: Int = check(tally, up, "the service answers on " + to_string(port),
+    "it never answered, so nothing below could be asked");
+
+if up {
+    match http_get(127, 0, 0, 1, port, "127.0.0.1", "/languages") {
+        Ok(reply) => {
+            let x12: Int = check(tally,
+                contains(reply.body, "\"id\":\"burxt\"") && contains(reply.body, "\"backend\""),
+                "/languages names the environments and the backend",
+                "it answered " + first_line(reply.body));
+        }
+        Error(why) => {
+            let x12: Int = check(tally, false, "/languages answers", why);
+        }
+    }
+
+    // **An environment nobody provisioned is REFUSED, not built.** Provisioning takes minutes and this
+    // endpoint is on the path of a keystroke, so a `/run` that quietly started a build would look like a
+    // hung playground to every visitor on the page.
+    match http_post(127, 0, 0, 1, port, "127.0.0.1", "/run", "application/json",
+            "\{\"env\":\"nosuch\",\"source\":\"x\"\}") {
+        Ok(reply) => {
+            let x13: Int = check(tally, reply.status == 409 && contains(reply.body, "not provisioned"),
+                "an unprovisioned environment is refused with 409 rather than built",
+                "status " + to_string(reply.status) + ": " + first_line(reply.body));
+        }
+        Error(why) => {
+            let x13: Int = check(tally, false, "an unprovisioned environment is refused", why);
+        }
+    }
+
+    // **A filename is not a name.** `../../etc/passwd` as an environment would otherwise read a
+    // declaration anywhere on the disk.
+    match http_post(127, 0, 0, 1, port, "127.0.0.1", "/run", "application/json",
+            "\{\"env\":\"../../etc/passwd\",\"source\":\"x\"\}") {
+        Ok(reply) => {
+            let x14: Int = check(tally, reply.status == 400,
+                "a traversal in place of an environment name is refused",
+                "status " + to_string(reply.status) + ": " + first_line(reply.body));
+        }
+        Error(why) => {
+            let x14: Int = check(tally, false, "a traversal is refused", why);
+        }
+    }
+
+    // The whole loop: start a run, poll until it is done, and read what it printed.
+    let mutable run_id: String = "";
+    match http_post(127, 0, 0, 1, port, "127.0.0.1", "/run", "application/json",
+            "\{\"env\":\"burxt\",\"source\":\"print(\\\"0123456789\\\");\\n\"\}") {
+        Ok(reply) => {
+            let marker: String = "\"run\":\"";
+            let at: Int = string_find(reply.body, marker);
+            if at >= 0 {
+                let from: Int = at + len(marker);
+                let end: Int = string_find_from(reply.body, "\"", from);
+                if end > from {
+                    run_id = substring(reply.body, from, end - from);
+                }
+            }
+        }
+        Error(why) => { run_id = ""; }
+    }
+    let x15: Int = check(tally, len(run_id) > 0, "POST /run answers with a run id immediately",
+        "no id came back");
+
+    if len(run_id) > 0 {
+        let mutable done: Bool = false;
+        let mutable body: String = "";
+        let mutable polls: Int = 0;
+        while polls < 60 && !done {
+            match http_get(127, 0, 0, 1, port, "127.0.0.1", "/run/" + run_id) {
+                Ok(reply) => {
+                    body = reply.body;
+                    done = contains(body, "\"done\"");
+                }
+                Error(why) => { done = false; }
+            }
+            if !done {
+                let waited: Capture = os_capture_status("sleep 0.25");
+            }
+            polls += 1;
+        }
+        let x16: Int = check(tally, done && contains(body, "0123456789"),
+            "polling the run reaches `done` with the program's output",
+            "after " + to_string(polls) + " polls: " + first_line(body));
+
+        // **`?from=N` returns what FOLLOWED byte N**, and past-the-end is empty rather than a refusal —
+        // `substring` would trap on a length past the end, and `from` arrives from a query string.
+        let mutable offset_ok: Bool = false;
+        match http_get(127, 0, 0, 1, port, "127.0.0.1", "/run/" + run_id + "?from=4") {
+            Ok(reply) => { offset_ok = contains(reply.body, "456789") && !contains(reply.body, "0123"); }
+            Error(why) => { offset_ok = false; }
+        }
+        let mutable past_end_ok: Bool = false;
+        match http_get(127, 0, 0, 1, port, "127.0.0.1", "/run/" + run_id + "?from=9999") {
+            Ok(reply) => {
+                past_end_ok = reply.status == 200 && contains(reply.body, "\"stdout\":\"\"");
+            }
+            Error(why) => { past_end_ok = false; }
+        }
+        let x17: Int = check(tally, offset_ok && past_end_ok,
+            "?from=N returns only what followed byte N, and past the end is empty rather than a refusal",
+            "from=4 correct: " + to_string(offset_ok) + ", from=9999 correct: "
+                + to_string(past_end_ok));
+    }
+}
+
+let stopped: Capture = os_capture_status("kill " + service_pid + " 2>/dev/null");
 
 print("");
 print(to_string(tally.ran) + " checked, " + to_string(tally.broken) + " broken");
