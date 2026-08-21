@@ -63,11 +63,25 @@
     await import('./adapters/sbmx.js');
     await import('./adapters/burxt.js');
 
+    // **The service is configuration, not a constant.** An embed points at whichever control plane
+    // serves it, and a Pages embed with no service still works for every language that answers in the
+    // browser — which is the whole reason the registry allows both kinds of adapter.
+    const params = new URLSearchParams(location.search);
+    const service = params.get('service') || '';
+
+    // **A showcase is a mode and a source, so those are parameters rather than constants.** This is not
+    // a test affordance: embedding one showcase on a page about one thing is exactly "open in this
+    // language, with this code in the editor", and the defaults below are the demo the front page shows.
+    const mode = params.get('mode') || 'bmx';
+    const given = params.get('source');
+
     const app = await comet.mount({
       root: document.querySelector('#root'),
       base: './',
-      mode: 'bmx',
-      source: '# Receipt {{ reference }}\n\nThank you, {{ name }}. Your total is **{{ total }}**.\n',
+      service,
+      mode,
+      source: given !== null ? given
+        : '# Receipt {{ reference }}\n\nThank you, {{ name }}. Your total is **{{ total }}**.\n',
       bindings: '{\n  "reference": "A-1042",\n  "name": "Ada",\n  "total": "£49.00"\n}',
     });
 
@@ -84,10 +98,23 @@
     // So this waits for the condition. The deadline stays, but only as a floor for REPORTING: if the
     // render never lands, the report still goes out and still says so, rather than hanging and letting
     // an outer `timeout` decide what happened.
+    // **It waits for AN ANSWER, not for a rendered one.** The first version watched only for
+    // `[data-comet-rendered]`, which a preview sets — so a language whose answer is TEXT never satisfied
+    // it and the page sat out the whole loop before reporting. A service-backed run is text, and it also
+    // takes a second or two rather than milliseconds, so the two failures compounded: waiting for the
+    // wrong thing, for less time than the right thing needs.
+    //
+    // The condition is "the output pane has something in it, or a preview was promoted", and the budget
+    // is generous because a sandbox has to start.
+    const answered = () => {
+      if (document.querySelector('[data-comet-rendered]')) return true;
+      const out = document.querySelector('.comet-out');
+      return !!(out && (out.textContent || '').trim().length > 0);
+    };
     let landed = false;
-    for (let i = 0; i < 120 && !landed; i += 1) {
-      landed = !!document.querySelector('[data-comet-rendered]');
-      if (!landed) await new Promise((r) => setTimeout(r, 25));
+    for (let i = 0; i < 600 && !landed; i += 1) {
+      landed = answered();
+      if (!landed) await new Promise((r) => setTimeout(r, 50));
     }
 
     document.body.dataset.cometReady = 'yes';

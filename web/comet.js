@@ -46,11 +46,60 @@ export function register(adapter) {
   if (!adapter || typeof adapter.id !== 'string' || !adapter.id) {
     throw new Error('comet.register needs an { id }');
   }
-  if (typeof adapter.run !== 'function') {
-    throw new Error(`comet.register('${adapter.id}') needs a run({ source, bindings }) function`);
+  // **An adapter answers in the browser or names a service, and it must do one of them.** A language
+  // whose toolchain cannot be compiled to wasm — most of them — supplies `service: '<env>'` and the
+  // control plane runs it in a sandbox. A language that can, supplies `run` and needs no service at all,
+  // which is what keeps a GitHub Pages embed working with no backend behind it.
+  if (typeof adapter.run !== 'function' && typeof adapter.service !== 'string') {
+    throw new Error(`comet.register('${adapter.id}') needs either a run({ source, bindings }) function `
+      + `or service: '<environment>' naming an environment the control plane has provisioned`);
   }
   adapters.set(adapter.id, { label: adapter.id, ...adapter });
   return adapter.id;
+}
+
+// Where the control plane is, if there is one. Set by `mount({ service })`.
+let serviceBase = '';
+
+/** Run one source through the control plane: start it, then poll until it is done. */
+async function viaService(env, source) {
+  if (!serviceBase) {
+    return { error: `\`${env}\` runs in a sandbox, and this playground was mounted without a service.`
+      + ` Pass mount({ service: 'https://…' }) to reach one.` };
+  }
+  const started = await fetch(`${serviceBase}/run`, {
+    method: 'POST', headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ env, source }),
+  });
+  const opening = await started.json().catch(() => ({}));
+  if (!started.ok || !opening.run) {
+    // The service says why in `error`, and passing it through is the difference between a blank pane
+    // and a reader who knows an environment needs provisioning.
+    return { error: opening.error || `the service refused this run (HTTP ${started.status})` };
+  }
+
+  // **Polled, because the service cannot stream.** Burxt's `http.bx` has no chunked transfer encoding
+  // in either direction, so the console asks again rather than being pushed to. The interval is short
+  // enough to feel live and long enough not to hammer a box serving many embeds.
+  const deadline = Date.now() + 120000;
+  while (Date.now() < deadline) {
+    const reply = await fetch(`${serviceBase}/run/${opening.run}`);
+    const state = await reply.json().catch(() => ({}));
+    if (state.status === 'done') {
+      const out = (state.stdout || '') + (state.stderr || '');
+      // A non-zero exit is not a broken playground, it is the program's answer — so it is shown as
+      // output with its code, not as an error the visitor caused.
+      if (state.timed_out) {
+        return { error: `${out}\n[killed at the deadline after ${state.ms}ms]` };
+      }
+      if (state.exit !== 0) {
+        return { output: `${out}\n[exit ${state.exit} in ${state.ms}ms]` };
+      }
+      return { output: out };
+    }
+    await new Promise((r) => setTimeout(r, 150));
+  }
+  return { error: 'the run never finished, and the service stopped answering for it' };
 }
 
 export function registered() {
@@ -65,6 +114,9 @@ export async function run(mode, source, bindings) {
     // a blank pane gives them nothing to search for.
     const have = [...adapters.keys()].join(', ') || 'none';
     return { error: `no adapter registered for \`${mode}\`. Registered: ${have}.` };
+  }
+  if (typeof adapter.run !== 'function') {
+    return viaService(adapter.service, source);
   }
   try {
     const answer = await adapter.run({ source, bindings });
@@ -103,8 +155,9 @@ function intercept(base) {
   };
 }
 
-export async function mount({ root, base = './', mode, source = '', bindings = '' } = {}) {
+export async function mount({ root, base = './', mode, source = '', bindings = '', service = '' } = {}) {
   if (!root) throw new Error('comet.mount needs a root element');
+  serviceBase = String(service || '').replace(/\/$/, '');
   intercept(base);
   scope = bindings;
   const first = mode || (registered()[0] && registered()[0].id) || 'none';

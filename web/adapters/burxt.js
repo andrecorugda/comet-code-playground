@@ -1,22 +1,20 @@
-// not-burxt: platform — registers Burxt with the browser-side registry, and calls `bx.play` in the
-//            wasm. The compiler is not in the browser, so this runs what the engine can and says so
-// Burxt, and an honest account of why it checks nothing yet.
+// not-burxt: platform — registers Burxt with the browser-side registry. It declares a SERVICE rather
+//            than a run function: the compiler is not in the browser, so a real answer comes from a
+//            sandbox on the control plane. Three lines of configuration, and no decision in any of them
+// Burxt, run where a compiler can actually live.
 //
-// Registered rather than omitted, because a missing tab is indistinguishable from a broken one and an
-// embedder deserves to know the mode exists and what it is waiting on.
+// **This used to be an apology.** The adapter registered a `run` that explained, at length, why nothing
+// happened: the self-hosted compiler builds for wasm32 but has no check-only entry point, its
+// diagnostics are printed rather than returned, and running a program needs `llc` between the emitted
+// LLVM IR and a module. All true, and all of it the wrong problem to solve — the answer was never to get
+// a compiler into the browser. It was to put the browser in front of a sandbox that has one.
+//
+// So this names an environment and stops. `environments/burxt.json` says what to install; the control
+// plane provisions it once and runs a visitor's source in a microVM with no network and a deadline.
 import comet from '../comet.js';
 
 comet.register({
   id: 'burxt',
   label: 'Burxt',
-  async run() {
-    return {
-      error: 'Burxt is not checked in the browser yet.\n\n'
-        + 'The self-hosted compiler builds for wasm32 and returns real diagnostics — that part is\n'
-        + 'measured. What is missing is a check-only entry point, because the two existing entries\n'
-        + 'reach for a filesystem to capture diagnostics that are PRINTED rather than returned.\n\n'
-        + 'Running a program is further: the compiler emits LLVM IR text, so `llc` stands between\n'
-        + 'that and a module. Porting a linker would not help — `llc` is the larger tool.',
-    };
-  },
+  service: 'burxt',
 });

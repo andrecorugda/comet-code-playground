@@ -330,6 +330,97 @@ let x3: Int = check(tally,
     "the registry holds " + string_join(modes, ", ") + " — an adapter failed to register, and a missing"
         + " tab is indistinguishable from a broken one");
 
+// ---- and the same page against the real control plane -------------------------------------------
+//
+// **Everything above proves the page mounts and that a language answering IN the browser works.** This
+// proves the other half: a language that cannot possibly run in a browser — Burxt needs a compiler and a
+// C toolchain — reaching a sandbox and coming back with what it printed.
+//
+// It is a second drive rather than an extra assertion on the first because it is a different page: a
+// showcase is a mode and a source, and this one opens in Burxt with a program in the editor.
+//
+// **`--dump-dom` cannot see this and that is why the page reports.** The dump fires on the load event
+// while the run is still in flight; measured while building this, a dump came back with an empty output
+// pane for a run the service had already performed. The page waiting for its own answer and posting it
+// is the only observer that knows when there is something to look at.
+if !prove {
+    let mutable service_report: String = "";
+    match file_temp_directory("comet-service-report") {
+        None => {
+            print_error("cannot make a temporary directory");
+            exit(2);
+        }
+        Some(dir) => { service_report = dir + "/report.json"; }
+    }
+
+    let control_port: Int = 8361;
+    let control: Capture = os_capture_status(
+        "./comet-service --serve " + to_string(control_port) + " >/dev/null 2>&1 & echo $!");
+    let control_pid: String = string_trim(control.output);
+    let settling: Capture = os_capture_status("sleep 0.5");
+
+    // Provisioning is a separate, deliberate step — a run will not do it, so the check has to.
+    let provisioned: Capture = os_capture_status(
+        "curl -s -X POST http://127.0.0.1:" + to_string(control_port)
+        + "/provision -d '\{\"env\":\"burxt\"\}'");
+    let ready: Bool = string_find(provisioned.output, "reference") >= 0;
+
+    let mutable page_port: Int = 0;
+    let mutable page_listener: Int = 0 - 1;
+    match net_listen_any_port(16) {
+        None => {
+            print_error("cannot listen for the second page");
+            exit(2);
+        }
+        Some(fd) => { page_listener = fd; }
+    }
+    match net_port_of(page_listener) {
+        None => {
+            print_error("cannot read the second port back");
+            exit(2);
+        }
+        Some(p) => { page_port = p; }
+    }
+
+    let second: Site = Site { root: "web", report: service_report };
+    let second_handler: dynamic Handler = second;
+    let showcase: String = "http://127.0.0.1:" + to_string(page_port) + "/index.html"
+        + "?service=http://127.0.0.1:" + to_string(control_port)
+        + "&mode=burxt&source=print(%22a%20visitor%20ran%20this%20in%20a%20sandbox%22)%3B";
+    let opened: Capture = os_capture_status(file_quote(binary)
+        + " --headless --disable-gpu --no-sandbox --disable-dev-shm-usage "
+        + file_quote(showcase) + " >/dev/null 2>&1 & echo $!");
+    let second_pid: String = string_trim(opened.output);
+
+    let mutable answered: Int = 0;
+    while !file_exists(service_report) && answered < 400 {
+        let ok: Bool = http_serve_one(page_listener, second_handler, 4194304);
+        answered += 1;
+    }
+    let shut: Bool = net_close(page_listener);
+    let gone: Capture = os_capture_status("kill " + second_pid + " 2>/dev/null");
+    let stopped: Capture = os_capture_status("kill " + control_pid + " 2>/dev/null");
+
+    let mutable pane: String = "";
+    let mutable service_mounted: Bool = false;
+    if file_exists(service_report) {
+        match json_parse(file_read(service_report)) {
+            Ok(value) => {
+                service_mounted = truth_of(field_of(value, "mounted"));
+                pane = text_of(field_of(value, "html"));
+            }
+            Error(bad) => { pane = ""; }
+        }
+    }
+
+    let x4: Int = check(tally, ready, "the control plane provisions the Burxt environment",
+        "provisioning answered: " + string_trim(provisioned.output));
+    let x5: Int = check(tally, service_mounted && contains(pane, "a visitor ran this in a sandbox"),
+        "a Burxt showcase runs in a sandbox and its output reaches the page",
+        "mounted=" + to_string(service_mounted) + " after " + to_string(answered)
+            + " request(s); the pane held: " + substring(pane, 0, 200));
+}
+
 print("");
 if prove {
     if tally.broken > 0 {
@@ -344,8 +435,8 @@ if tally.broken > 0 {
     print(to_string(tally.broken) + " of " + to_string(tally.ran) + " things wrong in the browser");
     exit(1);
 }
-if tally.ran != 3 {
-    print("only " + to_string(tally.ran) + " of 3 checks ran");
+if tally.ran != 5 {
+    print("only " + to_string(tally.ran) + " of 5 checks ran");
     exit(1);
 }
 print("the playground mounts and star answers, in a real browser, over "

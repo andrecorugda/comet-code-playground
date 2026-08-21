@@ -112,8 +112,48 @@ LLD=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/rust-lld | head -1)
   build/entry.o -o web/comet-engine.wasm
 
 burxt build tests/browser.bx -o comet-browser     # the browser harness
+burxt build service/comet-service.bx -o comet-service   # the control plane
+burxt build tests/service.bx -o comet-service-test      # its checks
+
+./comet-service --serve 8080 &                    # the control plane
+curl -X POST localhost:8080/provision -d '{"env":"burxt"}'   # build an environment, once
 ./comet-serve web 8000                            # then open http://localhost:8000
-timeout 90 ./comet-browser                        # checks it in a real browser
+
+timeout 900 ./comet-service-test                  # the environment and run core, 17 checks
+timeout 300 ./comet-browser                       # the page, in a real browser, 5 checks
+```
+
+## Running a language
+
+A **playground** is an environment plus showcases. The environment is a declaration under
+`environments/`:
+
+```json
+{ "id": "burxt", "label": "Burxt", "image": "ubuntu:24.04",
+  "install":   ["…install the toolchain…"],
+  "bootstrap": ["cd /work && burxt fetch"],
+  "file": "main.bx",
+  "run":  ["burxt", "run", "/work/main.bx"],
+  "timeout_ms": 10000, "vcpus": 1 }
+```
+
+`install` and `bootstrap` run **once, at provision, with the network on**, and the result is baked into
+an image. A run resumes from that image with **no network, a deadline it cannot extend, and a filesystem
+nothing else will ever see** — which is why anything a language needs to download belongs in
+`bootstrap` rather than in the program.
+
+A **showcase** is a mode and a source, so it is a URL:
+
+```
+…/index.html?service=https://your-control-plane&mode=burxt&source=print(%22hi%22)%3B
+```
+
+Embed that and a visitor edits the code and sees the result. Their edits stay in their own browser; the
+showcase you saved is unchanged.
+
+**A language that answers in the browser needs no control plane at all.** An adapter supplies either a
+`run` function — BMX and star do, through wasm — or `service: '<environment>'`, and only the second kind
+needs a service. That is what keeps a GitHub Pages embed working with nothing behind it.
 ```
 
 **Four things in that block used to be wrong, and each one only a reader would have found.**
