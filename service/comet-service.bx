@@ -186,7 +186,7 @@ function provisioned_reference(env: String) -> String allocates touches files, c
 // a temporary file and renaming it: a reader that sees the file sees a complete one, and `GET /run/<id>`
 // treats its absence as "still running". A half-written result read as a finished run would report a
 // truncated program as a successful one.
-function perform(dir: String) -> Int touches files, commands, input {
+function perform(dir: String) -> Int touches files, commands, input, clock {
     let env: String = string_trim(file_read(dir + "/env"));
     let source: String = file_read(dir + "/source");
     let reference: String = string_trim(file_read(dir + "/reference"));
@@ -221,7 +221,7 @@ function perform(dir: String) -> Int touches files, commands, input {
 
 implement Handler for Service {
     function (self) handle(request: HttpRequest) -> HttpResponse
-            allocates touches files, commands, input {
+            allocates touches files, commands, input, clock {
         // The embed lives on another origin, so a browser asks first.
         if request.method == "OPTIONS" {
             let mutable headers: [HttpHeader] = [];

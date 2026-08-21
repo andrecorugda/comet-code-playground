@@ -98,13 +98,12 @@ markup.
 **One command, once everything is built:**
 
 ```sh
-burxt build dev.bx -o comet-dev
-./comet-dev                 # or ./comet-dev <control-port> <page-port>
+burxt build dev.bx -o comet-dev && ./comet-dev
 ```
 
-It starts the control plane and the static server, provisions any environment that is not ready, prints
-the URLs, and waits. Press Enter to stop both. Defaults are **7788** and **7789** rather than 8080/8000,
-because those are the two ports most likely to be taken already.
+Then open **http://localhost:3000**. It starts the control plane and the static server, provisions any
+environment that is not ready, prints the URLs, and waits — press Enter to stop both. The control plane
+is on 3001; pass `./comet-dev <page> <control>` to move either.
 
 ## The long way
 

@@ -14,16 +14,33 @@ use "std/string.bx";
 use "std/http.bx";
 use "std/os.bx";
 
-// **Not 8080 and not 8000, and that is from a collision rather than taste.** This machine already runs
-// an nginx on 8080, so the control plane could not bind and the first version reported "the control
-// plane never answered" — the symptom, not the cause, while its own log said `cannot listen on 8080`
-// one line away. Both are overridable: `./comet-dev <control> <page>`.
-const CONTROL: Int = 7788;
-const PAGE: Int = 7789;
+// **3000 for the page, because that is the port a web developer reaches for.** The control plane sits
+// beside it on 3001. Both overridable: `./comet-dev <page> <control>` — the page first, because that is
+// the one you open.
+//
+// It was 8080/8000 and then 7788/7789, and the reason for moving twice is worth keeping: this machine
+// already runs an nginx on 8080, so the control plane could not bind, and the first version reported
+// "the control plane never answered" — the symptom — while its own log said `cannot listen on 8080` one
+// line away. 3000 and 3001 were measured free here; if they are not on yours, the arguments are why.
+const PAGE: Int = 3000;
+const CONTROL: Int = 3001;
 
+// **A binary that exists is not a binary that is current, and trusting one hid a source that had
+// stopped compiling.** This returned early on `file_exists`, so a locally-built `comet-service` from
+// before an edit satisfied it — and a fresh clone was the first thing to discover the file no longer
+// built. The class is the one this family keeps meeting: the local tree had something a clean checkout
+// did not, and the check that should have noticed was the one skipping the work.
+//
+// `find -newer` is the make-like question: rebuild when the source is newer than the binary. Cheap, and
+// it cannot be satisfied by a leftover.
 function built(path: String, source: String) -> Bool touches files, commands, input {
     if file_exists(path) {
-        return true;
+        let stale: Capture = os_capture_status(
+            "find " + file_quote(source) + " -newer " + file_quote(path) + " 2>/dev/null");
+        if len(string_trim(stale.output)) == 0 {
+            return true;
+        }
+        print("  " + source + " is newer than " + path + " — rebuilding");
     }
     print("  building " + path);
     let made: Capture = os_capture_status("burxt build " + file_quote(source) + " -o "
@@ -50,10 +67,10 @@ if !file_exists("web/comet-engine.wasm") || !file_exists("web/playground.wasm") 
 let mutable control_port: Int = CONTROL;
 let mutable page_port: Int = PAGE;
 if os_arg_count() > 1 {
-    control_port = string_to_int(os_arg(1), CONTROL);
+    page_port = string_to_int(os_arg(1), PAGE);
 }
 if os_arg_count() > 2 {
-    page_port = string_to_int(os_arg(2), PAGE);
+    control_port = string_to_int(os_arg(2), CONTROL);
 }
 
 let control: Capture = os_capture_status("./comet-service --serve " + to_string(control_port)
@@ -117,7 +134,7 @@ while e < len(declarations) {
 }
 
 print("");
-print("  the playground   http://localhost:" + to_string(page_port)
+print("  ➜  open   http://localhost:" + to_string(page_port)
     + "/?service=http://localhost:" + to_string(control_port));
 print("");
 print("  a BMX showcase   http://localhost:" + to_string(page_port) + "/?mode=bmx");
