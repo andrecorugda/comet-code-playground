@@ -1,0 +1,101 @@
+// The playground, served locally.
+//
+//     burxt build serve.bx -o comet-serve
+//     ./comet-serve web 8000        # then open http://localhost:8000
+//
+// **The README used to say `python3 -m http.server` here.** It worked, and it put Python in the one set
+// of instructions a reader actually follows — in a product whose whole argument is that you do not need
+// another language. `wasm` needs a real content type and `fetch` needs an origin, so a server is
+// genuinely required; what was not required was somebody else's.
+//
+// **A `.wasm` body looked ruled out by the type and is not.** `HttpResponse.body` is a `String` and a
+// Burxt String is UTF-8, so this looked impossible until it was measured: the validation lives at
+// `file_read`, which refuses non-text at the door, while `from_bytes` takes arbitrary bytes — 0x00 and
+// 0xFF included. An 83,629-byte module served this way came back with a matching sha256, which also
+// exercises `net_write`'s partial-write path. So the rule that got three of us this week: **a type says
+// what a function accepts, not what the runtime refuses, and the refusal has a location.**
+use "std/files.bx";
+use "std/string.bx";
+use "std/http.bx";
+use "std/os.bx";
+
+class Site { root: String }
+
+// **A wasm served as `application/octet-stream` fails in the browser and not here.**
+// `WebAssembly.instantiateStreaming` requires `application/wasm` and refuses anything else, so a
+// wrong content type is a page that loads and a module that never instantiates.
+pure function content_type(path: String) -> String {
+    if string_ends_with(path, ".html") { return "text/html; charset=utf-8"; }
+    if string_ends_with(path, ".js") { return "text/javascript; charset=utf-8"; }
+    if string_ends_with(path, ".css") { return "text/css; charset=utf-8"; }
+    if string_ends_with(path, ".wasm") { return "application/wasm"; }
+    if string_ends_with(path, ".json") { return "application/json"; }
+    if string_ends_with(path, ".svg") { return "image/svg+xml"; }
+    if string_ends_with(path, ".png") { return "image/png"; }
+    return "application/octet-stream";
+}
+
+implement Handler for Site {
+    // **Read first, then answer.** Writing a 200 and then discovering the file is missing leaves nothing
+    // to say — a missing favicon request is the request that finds this.
+    function (self) handle(request: HttpRequest) -> HttpResponse allocates touches files {
+        let mutable path: String = request.path;
+        if string_starts_with(path, "/") {
+            path = substring(path, 1, len(path) - 1);
+        }
+        if len(path) == 0 {
+            path = "index.html";
+        }
+        // No climbing out of the served directory. This is a development server and it still should not
+        // hand out `../../.ssh/id_rsa` to anything that asks.
+        let mutable headers: [HttpHeader] = [];
+        if string_find(path, "..") >= 0 {
+            return HttpResponse { status: 403, headers: headers, body: "no" };
+        }
+        match file_read_bytes(self.root + "/" + path) {
+            None => {
+                return HttpResponse { status: 404, headers: headers, body: "not here: " + path };
+            }
+            Some(bytes) => {
+                let h: Int = push(headers,
+                    HttpHeader { name: "content-type", value: content_type(path) });
+                return HttpResponse { status: 200, headers: headers, body: from_bytes(bytes) };
+            }
+        }
+    }
+}
+
+let mutable root: String = "web";
+let mutable port: Int = 8000;
+if os_arg_count() > 1 {
+    root = os_arg(1);
+}
+if os_arg_count() > 2 {
+    port = string_to_int(os_arg(2), 8000);
+}
+
+if !file_exists(root + "/index.html") {
+    print_error("comet-serve: no " + root + "/index.html — run this from the repository root");
+    exit(2);
+}
+// **Named, because a stale engine is the failure this cannot see.** `engine.js` fetches
+// `comet-engine.wasm`; if the build block was followed only as far as `entry.o`, the module served here
+// is whatever was committed and the page looks fine while testing nothing new.
+if !file_exists(root + "/comet-engine.wasm") {
+    print_error("comet-serve: no " + root + "/comet-engine.wasm — the engine is not linked yet");
+    exit(2);
+}
+
+print("serving " + root + " on http://localhost:" + to_string(port));
+let site: Site = Site { root: root };
+let handler: dynamic Handler = site;
+match http_serve(port, handler, 4194304) {
+    None => {
+        print_error("comet-serve: cannot listen on " + to_string(port)
+            + " — something else is probably using it");
+        exit(1);
+    }
+    Some(served) => {
+        print("served " + to_string(served) + " request(s)");
+    }
+}

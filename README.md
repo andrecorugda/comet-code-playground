@@ -97,11 +97,37 @@ markup.
 
 ```sh
 burxt fetch                                       # star and BMX, at the tags in burxt.lock
-star-build Playground.sbmx playground build       # the interface
-burxt build entry.bx --target wasm32-unknown-unknown -o build/entry.o   # the engine
-cd web && python3 -m http.server                  # then open http://localhost:8000
+burxt build serve.bx -o comet-serve               # the local server
+
+# the interface. star-build comes from the star repository and is not on PATH by default
+PATH="$HOME/star-burxt:$PATH" star-build Playground.sbmx playground build
+
+# the engine, in two steps — the second is the one that writes what the page actually fetches
+burxt build entry.bx --target wasm32-unknown-unknown -o build/entry.o
+LLD=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/rust-lld | head -1)
+"$LLD" -flavor wasm --no-entry --allow-undefined --gc-sections \
+  --export=burxt.alloc --export=memory --export=bx.play --export=bx.render \
+  -z stack-size=1048576 --initial-memory=4194304 --max-memory=268435456 \
+  build/entry.o -o web/comet-engine.wasm
+
+./comet-serve web 8000                            # then open http://localhost:8000
 node tests/browser.mjs                            # checks it in a real browser
 ```
+
+**Three things in that block used to be wrong, and each one only a reader would have found.**
+
+It stopped at `build/entry.o` and never linked it. `web/engine.js` fetches `comet-engine.wasm`, so
+following the documented steps left the committed module in place and the page looked fine while testing
+nothing that was just built. It named `star-build` without saying where it comes from. And it served the
+directory with `python3 -m http.server` — which worked, and put another language in the one set of
+instructions a reader actually follows, in a product whose argument is that you do not need one.
+
+`serve.bx` replaces it in 90 lines, and the content type is the reason a server is needed at all:
+`WebAssembly.instantiateStreaming` refuses anything that is not `application/wasm`, so a wrong header is
+a page that loads and a module that never instantiates. It also refuses `..` and says which file is
+missing rather than 404-ing silently. Verified through it: correct types on every asset, the engine
+fetched byte-for-byte, a raw `../` traversal answered 403, and the playground mounting in headless
+Chrome.
 
 **The values pane is JSON.** Strings, numbers, `true`/`false` and `null` become slot values; an object
 or a list is refused by name, because a slot holds one value and a binding that went missing quietly is
