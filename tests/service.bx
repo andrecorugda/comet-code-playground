@@ -108,12 +108,24 @@ let x4: Int = check(tally, again.ok && again.reference == first.reference,
 
 // ---- a run --------------------------------------------------------------------------------------
 
+// **EXACTLY the program's bytes, not merely containing them**, and the difference is the console.
+//
+// This said `contains` until the language session measured that `burxt run` emits nothing of its own on
+// either stream — stdout is *exclusively* the program's output. comet depends on that: the run command
+// is `burxt run /work/main.bx` and whatever comes back on stdout is shown to a visitor as what their
+// program printed. **A `contains` would have passed if the compiler ever prepended a line**, and the
+// visitor would have read the compiler's words as their own program's.
+//
+// The same reasoning is why they are routing `running app.bx` to stderr rather than stdout: a byte
+// nobody asked for, in a stream something is parsing. This is the check that would notice.
 let hello: Outcome = run_source(d, first.reference, "print(\"hello from a sandbox\");\n");
 let x5: Int = check(tally,
-    hello.exit == 0 && contains(hello.stdout, "hello from a sandbox") && !hello.timed_out,
-    "a program runs and its stdout comes back (" + to_string(hello.ms) + "ms)",
-    "exit=" + to_string(hello.exit) + " stdout=" + first_line(hello.stdout)
-        + " stderr=" + first_line(hello.stderr) + " " + hello.why);
+    hello.exit == 0 && hello.stdout == "hello from a sandbox\n" && !hello.timed_out,
+    "a program's stdout comes back with nothing added (" + to_string(hello.ms) + "ms)",
+    "exit=" + to_string(hello.exit) + " stdout=[" + hello.stdout + "] where"
+        + " [hello from a sandbox\\n] was expected — anything extra is the toolchain decorating a"
+        + " stream a visitor reads as their own output. stderr=" + first_line(hello.stderr)
+        + " " + hello.why);
 
 // **A program's own failure is not the harness failing.** Reporting exit 3 as "something went wrong"
 // would hide the one thing the visitor needs to see.
