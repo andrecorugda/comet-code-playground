@@ -134,13 +134,13 @@ while e < len(declarations) {
 }
 
 print("");
-print("  ➜  open   http://localhost:" + to_string(page_port)
-    + "/?service=http://localhost:" + to_string(control_port));
+// The bare URL, because the page finds the control plane on localhost by itself. Printing the long
+// form taught people to paste something they never need.
+print("  ➜  open   http://localhost:" + to_string(page_port));
 print("");
 print("  a BMX showcase   http://localhost:" + to_string(page_port) + "/?mode=bmx");
 print("  a Burxt one      http://localhost:" + to_string(page_port)
-    + "/?service=http://localhost:" + to_string(control_port)
-    + "&mode=burxt&source=print(%22hello%22)%3B");
+    + "/?mode=burxt&source=print(%22hello%22)%3B");
 print("");
 print("  control plane    http://localhost:" + to_string(control_port) + "/languages");
 print("  logs             /tmp/comet-control.log  /tmp/comet-page.log");
