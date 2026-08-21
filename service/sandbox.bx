@@ -607,8 +607,20 @@ function run_docker(d: Declaration, reference: String, work: String, scratch: St
 function run_vercel(d: Declaration, reference: String, work: String, scratch: String) -> Outcome
         allocates touches commands, files, input, clock {
     let seconds: Int = seconds_for(d.timeout_ms);
-    // The scratch directory's own name is already unique, so it is the run's name too — no randomness
-    // needed, and Burxt has no `Math.random` to reach for anyway.
+    // The scratch directory's own name is already unique, so it is the run's name too. `mktemp`
+    // guarantees that, which is a better guarantee than drawing an id and hoping.
+    //
+    // **This said "and Burxt has no `Math.random` to reach for anyway", which is false.** `std/random.bx`
+    // has a seeded PRNG — `random_from(seed)`, `random_below`, `random_shuffle`, `random_choice` — and OS
+    // entropy is reachable through `getentropy` with a `CPointer`, deliberately kept out of that module
+    // so it can live beside the other syscalls. Verified 2026-08-21.
+    //
+    // **The decision was right and the reason was invented**, which is the more dangerous pairing: a
+    // reader who trusts it now believes the language cannot do something it can. Fifth time today I have
+    // asserted an absent capability that exists — after `HttpResponse.body`, `file_write` on binary, the
+    // whole of `tools/gallery.mjs`, and a clock the language session had already shipped. The rule I keep
+    // proving: **a claim that a capability is missing needs a measurement, exactly like a claim that one
+    // works.**
     let slash: Int = string_rfind(scratch, "/");
     let name: String = "comet-run-" + substring(scratch, slash + 1, len(scratch) - slash - 1);
 
