@@ -95,6 +95,20 @@ markup.
 
 ## Running it here
 
+**One command, once everything is built:**
+
+```sh
+burxt build dev.bx -o comet-dev
+./comet-dev                 # or ./comet-dev <control-port> <page-port>
+```
+
+It starts the control plane and the static server, provisions any environment that is not ready, prints
+the URLs, and waits. Press Enter to stop both. Defaults are **7788** and **7789** rather than 8080/8000,
+because those are the two ports most likely to be taken already.
+
+## The long way
+
+
 ```sh
 burxt fetch                                       # star and BMX, at the tags in burxt.lock
 burxt build serve.bx -o comet-serve               # the local server

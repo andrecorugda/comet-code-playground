@@ -1,0 +1,63 @@
+/* not-burxt: platform — the layout Bootstrap does not have an opinion about: a two-column body, a
+ *            gutter locked to the editor's line height, and a console. Styling reaches the browser's
+ *            own language by definition; the markup it styles is BMX and the logic behind it is Burxt
+ *
+ * comet's own layout, on top of Bootstrap's stylesheet.
+ *
+ * **The gutter and the editor share a line height, and that is the only fragile thing here.** Line
+ * numbers drawn beside a textarea are only correct while both boxes agree on how tall a line is, so the
+ * two rules that set it are next to each other and neither should be changed alone.
+ */
+
+.comet { display: flex; flex-direction: column; min-height: 32rem; }
+.comet-body { display: grid; grid-template-columns: minmax(0, 1.15fr) minmax(0, 1fr);
+              gap: .75rem; align-items: stretch; min-height: 22rem; }
+
+/* editor: a gutter that does not scroll independently, and a textarea that fills the rest */
+.comet-editor { display: grid; grid-template-columns: auto minmax(0, 1fr);
+                border: 1px solid var(--bs-border-color); border-radius: .375rem; overflow: hidden;
+                background: var(--bs-tertiary-bg); }
+.comet-gutter { margin: 0; padding: .6rem .5rem .6rem .7rem; text-align: right;
+                color: var(--bs-secondary-color); background: var(--bs-secondary-bg);
+                border-right: 1px solid var(--bs-border-color); user-select: none;
+                font: 13px/1.55 var(--bs-font-monospace); overflow: hidden; }
+.comet-in { border: 0; border-radius: 0; resize: none; background: transparent;
+            padding: .6rem .7rem; font-size: 13px; line-height: 1.55; min-height: 22rem; }
+.comet-in:focus { box-shadow: none; background: transparent; }
+
+/* the right-hand column: a preview over the values that feed it */
+/* **Explicit rows, because `auto` let the Values box overflow the card.** With the preview on `1fr` and
+ * the values on `auto`, the column asked for more height than the body had and the textarea was clipped
+ * mid-JSON at the card's edge. A fixed row for the values makes the column's height predictable. */
+.comet-side { display: grid; grid-template-rows: minmax(0, 1fr) 8.5rem; gap: .75rem; min-width: 0; }
+.comet-panel { display: flex; flex-direction: column; min-height: 0; }
+.comet-label { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em;
+               color: var(--bs-secondary-color); margin-bottom: .3rem; }
+.comet-preview { flex: 1; margin: 0; overflow: auto; padding: .7rem; min-height: 8rem;
+                 border: 1px solid var(--bs-border-color); border-radius: .375rem;
+                 background: var(--bs-body-bg); white-space: pre-wrap; font-size: 13px; }
+/* A promoted preview is a rendered page, so it stops being preformatted text. */
+.comet-preview[data-comet-rendered] { white-space: normal; font: inherit; }
+.comet-scope { flex: 1; min-height: 0; resize: none; font-size: 12.5px; }
+
+/* the console: a transcript, so it reads like one */
+.comet-out { margin: 0; padding: .7rem; max-height: 12rem; min-height: 3.5rem; overflow: auto;
+             white-space: pre-wrap; font-size: 12.5px; border-radius: .375rem;
+             background: var(--bs-dark); color: var(--bs-light); }
+/* There was a `:empty::before` hint here and **it could never fire**: the component renders the console
+ * between BMX fences, so the element always holds at least a newline and is never `:empty`. A rule that
+ * cannot match is worse than no rule — it reads as a feature. The console just looks empty instead. */
+.comet-console-title { font-size: .7rem; text-transform: uppercase; letter-spacing: .06em; }
+
+/* A tab is "on" when the component says so — `aria-pressed={{ model.mode == "bmx" }}` in the markup.
+ *
+ * **Style on PRESENCE, not on a value.** star compiles a boolean attribute into a decision, so it emits
+ * `aria-pressed=""` when true and omits it entirely when false — which is HTML's own semantics, and the
+ * whole reason `checked="false"` is a bug. A selector written `[aria-pressed="true"]` matched nothing
+ * and the active tab was invisible. */
+.comet-tab[aria-pressed] { background: var(--bs-secondary-bg); color: var(--bs-emphasis-color);
+                           font-weight: 600; border-color: var(--bs-secondary); }
+
+@media (max-width: 46rem) {
+  .comet-body { grid-template-columns: minmax(0, 1fr); }
+}

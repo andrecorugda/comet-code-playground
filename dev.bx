@@ -1,0 +1,138 @@
+// Everything comet needs, running locally, in one command.
+//
+//     burxt build dev.bx -o comet-dev
+//     ./comet-dev
+//
+// Starts the control plane and the static server, provisions any environment that is not ready, prints
+// the URLs, and waits. Press Enter and it stops both.
+//
+// **It waits on stdin rather than trapping a signal**, because a Burxt program has no signal handler to
+// install — so Ctrl-C would leave two orphans behind. Blocking on a read means the stop path is the
+// ordinary one, and the thing that kills the children is the same code that started them.
+use "std/files.bx";
+use "std/string.bx";
+use "std/http.bx";
+use "std/os.bx";
+
+// **Not 8080 and not 8000, and that is from a collision rather than taste.** This machine already runs
+// an nginx on 8080, so the control plane could not bind and the first version reported "the control
+// plane never answered" — the symptom, not the cause, while its own log said `cannot listen on 8080`
+// one line away. Both are overridable: `./comet-dev <control> <page>`.
+const CONTROL: Int = 7788;
+const PAGE: Int = 7789;
+
+function built(path: String, source: String) -> Bool touches files, commands, input {
+    if file_exists(path) {
+        return true;
+    }
+    print("  building " + path);
+    let made: Capture = os_capture_status("burxt build " + file_quote(source) + " -o "
+        + file_quote(path) + " 2>&1");
+    if made.code != 0 {
+        print_error(made.output + made.errors);
+        return false;
+    }
+    return true;
+}
+
+if !built("./comet-service", "service/comet-service.bx") {
+    exit(1);
+}
+if !built("./comet-serve", "serve.bx") {
+    exit(1);
+}
+if !file_exists("web/comet-engine.wasm") || !file_exists("web/playground.wasm") {
+    print_error("comet-dev: web/comet-engine.wasm or web/playground.wasm is missing. The README's build");
+    print_error("           block writes both — the link step is the one people skip.");
+    exit(1);
+}
+
+let mutable control_port: Int = CONTROL;
+let mutable page_port: Int = PAGE;
+if os_arg_count() > 1 {
+    control_port = string_to_int(os_arg(1), CONTROL);
+}
+if os_arg_count() > 2 {
+    page_port = string_to_int(os_arg(2), PAGE);
+}
+
+let control: Capture = os_capture_status("./comet-service --serve " + to_string(control_port)
+    + " >/tmp/comet-control.log 2>&1 & echo $!");
+let control_pid: String = string_trim(control.output);
+let page: Capture = os_capture_status("./comet-serve web " + to_string(page_port)
+    + " >/tmp/comet-page.log 2>&1 & echo $!");
+let page_pid: String = string_trim(page.output);
+
+// Wait for the control plane rather than assuming it: 127.0.0.1 is four octets, which is the one
+// address a Burxt program can reach without resolving a name.
+let mutable up: Bool = false;
+let mutable tries: Int = 0;
+while tries < 60 && !up {
+    match http_get(127, 0, 0, 1, control_port, "127.0.0.1", "/languages") {
+        Ok(reply) => { up = reply.status == 200; }
+        Error(why) => { up = false; }
+    }
+    if !up {
+        let waited: Capture = os_capture_status("sleep 0.1");
+    }
+    tries += 1;
+}
+if !up {
+    let k1: Capture = os_capture_status("kill " + control_pid + " " + page_pid + " 2>/dev/null");
+    // **Show the log rather than name the file.** The cause is one line long and it was already
+    // written down; making somebody go and find it is how a symptom gets mistaken for a diagnosis.
+    print_error("comet-dev: the control plane never answered on " + to_string(control_port) + ":");
+    if file_exists("/tmp/comet-control.log") {
+        print_error("  " + string_trim(file_read("/tmp/comet-control.log")));
+    }
+    print_error("  a port in use is the usual reason — try `./comet-dev <control> <page>`");
+    exit(1);
+}
+
+// **Provisioned here, because a playground that greets you with 409 is not a playground.** A first build
+// takes minutes; every one after is cached, so this is slow once and instant afterwards.
+let listing: Capture = os_capture_status("ls environments/*.json 2>/dev/null");
+let declarations: [String] = string_lines(listing.output);
+let mutable e: Int = 0;
+while e < len(declarations) {
+    let path: String = string_trim(declarations[e]);
+    if len(path) > 0 {
+        let slash: Int = string_rfind(path, "/");
+        let dot: Int = string_rfind(path, ".");
+        let id: String = substring(path, slash + 1, dot - slash - 1);
+        if file_exists("state/" + id + ".json") {
+            print("  " + id + ": ready");
+        } else {
+            print("  " + id + ": provisioning (first time takes a few minutes)");
+            let made: Capture = os_capture_status("curl -s -X POST http://127.0.0.1:"
+                + to_string(control_port) + "/provision -d '\{\"env\":\"" + id + "\"\}'");
+            if string_find(made.output, "reference") < 0 {
+                print("  " + id + ": FAILED — " + string_trim(made.output));
+            } else {
+                print("  " + id + ": ready");
+            }
+        }
+    }
+    e += 1;
+}
+
+print("");
+print("  the playground   http://localhost:" + to_string(page_port)
+    + "/?service=http://localhost:" + to_string(control_port));
+print("");
+print("  a BMX showcase   http://localhost:" + to_string(page_port) + "/?mode=bmx");
+print("  a Burxt one      http://localhost:" + to_string(page_port)
+    + "/?service=http://localhost:" + to_string(control_port)
+    + "&mode=burxt&source=print(%22hello%22)%3B");
+print("");
+print("  control plane    http://localhost:" + to_string(control_port) + "/languages");
+print("  logs             /tmp/comet-control.log  /tmp/comet-page.log");
+print("");
+print("Press Enter to stop.");
+
+match os_read_line() {
+    None => { }
+    Some(line) => { }
+}
+let stopped: Capture = os_capture_status("kill " + control_pid + " " + page_pid + " 2>/dev/null");
+print("stopped.");

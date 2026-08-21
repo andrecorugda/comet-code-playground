@@ -1,32 +1,16 @@
 <!doctype html>
 <meta charset="utf-8">
 <title>comet — a code playground you can embed</title>
+<link rel="stylesheet" href="./vendor/bootstrap.min.css">
+<link rel="stylesheet" href="./comet.css">
 <style>
-  :root { color-scheme: light dark; --line: color-mix(in oklab, currentColor 22%, transparent); }
-  body { font: 15px/1.5 ui-sans-serif, system-ui, sans-serif; margin: 0; padding: 1.5rem; }
-  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 .25rem; }
-  .sub { opacity: .65; font-size: .85rem; margin: 0 0 1.25rem; }
-  .comet { display: grid; grid-template-columns: 1fr 1fr; grid-template-rows: auto 1fr auto;
-           gap: .75rem; min-height: 70vh; }
-  .comet-bar { grid-column: 1 / -1; display: flex; gap: .35rem; }
-  .comet-tab { font: inherit; font-size: .85rem; padding: .3rem .7rem; cursor: pointer;
-               background: transparent; color: inherit; border: 1px solid var(--line);
-               border-radius: 999px; }
-  .comet-tab:hover { background: color-mix(in oklab, currentColor 8%, transparent); }
-  .comet-in, .comet-out, .comet-scope {
-    font: 13px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace;
-    border: 1px solid var(--line); border-radius: 8px; padding: .8rem; margin: 0;
-    white-space: pre-wrap; overflow: auto; background: transparent; color: inherit;
-  }
-  .comet-in { resize: none; }
-  .comet-out[data-comet-rendered] { white-space: normal; font: inherit; }
-  .comet-scope { grid-column: 1 / -1; min-height: 4.5rem; resize: vertical; }
-  footer { margin-top: 1.5rem; font-size: .8rem; opacity: .55; }
-  footer a { color: inherit; }
+  body { padding: 1.5rem; max-width: 76rem; margin: 0 auto; }
+  h1 { font-size: 1.05rem; font-weight: 600; margin: 0 0 .2rem; }
+  .sub { font-size: .85rem; margin: 0 0 1rem; }
 </style>
 
 <h1>comet</h1>
-<p class="sub">An embeddable code playground. Everything runs in this page — nothing is uploaded.</p>
+<p class="sub text-body-secondary">An embeddable code playground. Everything runs in this page — nothing is uploaded.</p>
 
 <div id="root">loading…</div>
 

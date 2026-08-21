@@ -11,6 +11,7 @@ comet-serve
 comet-browser
 comet-service
 comet-service-test
+comet-dev
 
 # A run's inputs and its result, and the reference provisioning recorded. Both are per-host state: a
 # snapshot id means nothing on another machine, and a run belongs to the visitor who started it.

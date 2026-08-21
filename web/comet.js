@@ -81,8 +81,19 @@ async function viaService(env, source) {
   // **Polled, because the service cannot stream.** Burxt's `http.bx` has no chunked transfer encoding
   // in either direction, so the console asks again rather than being pushed to. The interval is short
   // enough to feel live and long enough not to hammer a box serving many embeds.
+  // **Two bounds, because one of them is for a person and the other is for a runaway.** The wall clock
+  // is what a visitor experiences — give up after two minutes — and the attempt count is a backstop so a
+  // service answering instantly forever cannot spin here.
+  //
+  // **Neither survives Chrome's `--virtual-time-budget`, and that is a fact about the instrument.**
+  // Virtual time fast-forwards `setTimeout` and `Date.now()` while a real network wait stays real, so
+  // 600 polls elapse in under a second and the console reports a failure about a run that is fine. I
+  // spent several captures learning that: virtual time cannot observe an asynchronous backend, because
+  // it removes exactly the waiting that is being observed. `tests/browser.bx` drives this path with real
+  // time and the page's own report, which is the only observer that works.
+  const attempts = 800;
   const deadline = Date.now() + 120000;
-  while (Date.now() < deadline) {
+  for (let tries = 0; tries < attempts && Date.now() < deadline; tries += 1) {
     const reply = await fetch(`${serviceBase}/run/${opening.run}`);
     const state = await reply.json().catch(() => ({}));
     if (state.status === 'done') {
@@ -136,22 +147,65 @@ export async function run(mode, source, bindings) {
 // the driver patched. A modified copy drifts from the framework it came from.
 let scope = '';
 
+// An answer, as the component reads it: what kind of thing it is, the thing, and a line for the status
+// badge. **One string could not carry four answers**, which is why the envelope exists.
+function envelope(answer, started) {
+  const ms = Date.now() - started;
+  if (answer.html !== undefined) {
+    return { kind: 'html', body: answer.html, status: `rendered · ${ms}ms` };
+  }
+  if (answer.error !== undefined) {
+    return { kind: 'text', body: answer.error, status: `refused · ${ms}ms` };
+  }
+  return { kind: 'text', body: answer.output ?? '', status: `ok · ${ms}ms` };
+}
+
+// **An edit and a Run are different requests, and the difference is money.** A language that answers in
+// this page is instant, so an edit should feel live. A language that starts a microVM costs a container
+// per keystroke, so an edit only schedules one and the newest edit wins. Pressing Run never waits.
+let pending = null;
+let inflight = 0;
+
 function intercept(base) {
   const real = window.fetch.bind(window);
   window.fetch = async (url, opts) => {
     const path = String(url);
     const body = (opts && opts.body) || '';
-    const bind = path.indexOf('/bind/');
-    if (bind >= 0) { scope = body; return new Response(''); }
-    const at = path.indexOf('/run/');
-    if (at >= 0) {
-      const mode = path.slice(at + 5);
-      const answer = await run(mode, body, scope);
-      // The component holds one string. `html` is marked so the mount can tell a preview from text.
-      if (answer.html !== undefined) return new Response(PREVIEW + answer.html);
-      return new Response(answer.error !== undefined ? answer.error : (answer.output ?? ''));
+
+    if (path.indexOf('/bind/') >= 0) { scope = body; return new Response(''); }
+
+    // Stop is honest about what it can do: a run already inside a sandbox has its own deadline, and
+    // nothing here can reach in and end it early. What this cancels is a scheduled one.
+    if (path.indexOf('/stop/') >= 0) {
+      if (pending) { clearTimeout(pending); pending = null; }
+      return new Response(JSON.stringify({ kind: 'text', body: '', status: 'stopped' }));
     }
-    return real(url, opts);
+
+    const edit = path.indexOf('/edit/');
+    const now = path.indexOf('/run/');
+    if (edit < 0 && now < 0) return real(url, opts);
+
+    // **Two routes of different length cannot share one offset.** `/edit/` is six characters and `/run/`
+    // is five; slicing both at +6 ate a character and asked for a language called `urxt`. The registry's
+    // own error is what made that a one-look diagnosis — *no adapter registered for `urxt`. Registered:
+    // bmx, sbmx, burxt* — which is the argument for naming what you did not find instead of blanking.
+    const mode = edit >= 0 ? path.slice(edit + 6) : path.slice(now + 5);
+    const adapter = adapters.get(mode);
+    const sandboxed = !!(adapter && typeof adapter.run !== 'function');
+
+    if (edit >= 0 && sandboxed) {
+      // Scheduled, not run. The component gets an immediate answer so the page never looks stuck, and
+      // the debounced run lands as a later reply.
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(() => { pending = null; window.fetch(`/run/${mode}`, { body }); }, 900);
+      return new Response(JSON.stringify({ kind: 'text', body: '', status: 'waiting…' }));
+    }
+
+    const started = Date.now();
+    inflight += 1;
+    const answer = await run(mode, body, scope);
+    inflight -= 1;
+    return new Response(JSON.stringify(envelope(answer, started)));
   };
 }
 
@@ -176,12 +230,15 @@ export async function mount({ root, base = './', mode, source = '', bindings = '
   // what was promoted is what tells our own writes from the framework's.
   let promoted = null;
   const promote = () => {
-    const out = root.querySelector('.comet-out');
+    const out = root.querySelector('.comet-preview');
     if (!out) return;
     if (promoted !== null && out.innerHTML === promoted) return;
-    const text = out.textContent || '';
-    if (text.startsWith(PREVIEW)) {
-      promoted = text.slice(PREVIEW.length);
+    // **Whatever reaches the preview pane IS markup**, because the component only fills it when an
+    // adapter answered with `kind: 'html'`. The prefix this used to look for is gone: the envelope says
+    // what kind of answer it is, so the pane does not have to be sniffed.
+    const text = (out.textContent || '').trim();
+    if (text.length > 0) {
+      promoted = text;
       out.innerHTML = promoted;
       out.dataset.cometRendered = 'yes';
     } else {
@@ -202,6 +259,19 @@ export async function mount({ root, base = './', mode, source = '', bindings = '
   if (box && source) {
     box.value = source;
     box.dispatchEvent(new InputEvent('input', { bubbles: true }));
+  }
+
+  // **A showcase runs on arrival, and for a sandboxed language that needs a deliberate Run.** Seeding
+  // the editor dispatches an `input`, which for a sandboxed language only SCHEDULES a run — correct
+  // while somebody is typing, wrong for a page that exists to show a result. Left alone, an embedded
+  // showcase opened on `waiting…` and sat there until the debounce elapsed.
+  //
+  // It presses the button the interface already has rather than reaching past it, so mounting and
+  // clicking Run go down the same path and there is one behaviour to reason about.
+  const opening = adapters.get(first);
+  if (opening && typeof opening.run !== 'function') {
+    const go = root.querySelector('.comet-run');
+    if (go) go.click();
   }
   const scopeBox = root.querySelector('.comet-scope');
   if (scopeBox && bindings) scopeBox.value = bindings;

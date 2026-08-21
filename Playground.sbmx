@@ -2,103 +2,271 @@
 use "std/string.bx";
 use "std/json.bx";
 
-class Model { source: String, result: String, mode: String, bindings: String }
-enum Msg { Edited(String), Chose(String), Bound(String) }
-
-pure function update(msg: Msg, m: Model) -> Model {
-    match msg {
-        Edited(text) => { return Model { source: text, result: m.result, mode: m.mode, bindings: m.bindings }; }
-        Chose(id) => { return Model { source: m.source, result: "", mode: id, bindings: m.bindings }; }
-        Bound(text) => { return Model { source: m.source, result: m.result, mode: m.mode, bindings: text }; }
-    }
+// comet's own interface, and it is a star component — which is the point. The playground that shows
+// star off is written in star, so every awkwardness in the framework is one we feel first.
+//
+// **The component knows nothing about languages, sandboxes or HTTP.** It asks `/run/<mode>` and something
+// outside answers with a JSON envelope. That indirection is the whole extension point: a language added
+// by somebody who has never seen this file answers the same way.
+class Model {
+    source: String,
+    // The line numbers beside the editor, computed here rather than drawn by script: the component knows
+    // the source, so it knows how many lines there are, and a gutter that is part of the render cannot
+    // drift out of step with the text it counts.
+    gutter: String,
+    mode: String,
+    bindings: String,
+    // What the program printed, and what it produced. Two panes because they are two things: a console
+    // is a transcript and a preview is a result, and a language may give either, both or neither.
+    console: String,
+    preview: String,
+    // `idle`, `running`, or a verdict like `exit 0 · 41ms`. One string because the view only ever shows
+    // it, and a status nobody branches on does not need to be an enum.
+    status: String,
+    running: Bool,
 }
 
-// **The playground needs no command star does not already have, and it does not know what a language
-// is.** `Send` carries a body to a URL and the reply arrives as `value`, so this asks `/run/<mode>` and
-// something outside answers. That indirection is the whole extension point: an adapter registered by
-// somebody who has never seen this file answers the same way star's generator does.
-pure function commands(msg: Msg, m: Model) -> [StarCmd] allocates {
-    let mutable out: [StarCmd] = [];
-    match msg {
-        Edited(text) => {
-            let a: Int = push(out, StarCmd.Send(1, "/run/" + m.mode, text));
-            let b: Int = push(out, StarCmd.Store("comet." + m.mode, text));
+enum Msg {
+    Edited(String),
+    Chose(String),
+    Bound(String),
+    Ran,
+    Stopped,
+    Cleared,
+}
+
+pure function gutter_for(source: String) -> String allocates {
+    let mutable out: String = "1";
+    let mutable n: Int = 2;
+    let mutable i: Int = 0;
+    while i < len(source) {
+        if byte_at(source, i) == 10 {
+            // A trailing newline does not open a line anybody can type on, so the last one is skipped.
+            if i + 1 < len(source) {
+                out = out + "\n" + to_string(n);
+                n += 1;
+            }
         }
-        Chose(id) => {
-            let c: Int = push(out, StarCmd.Send(1, "/run/" + id, m.source));
-        }
-        Bound(text) => {
-            // A binding change re-runs the same source: the scope is an input to the answer.
-            let d: Int = push(out, StarCmd.Send(2, "/bind/" + m.mode, text));
-            let e: Int = push(out, StarCmd.Send(1, "/run/" + m.mode, m.source));
-        }
+        i += 1;
     }
     return out;
 }
 
-// Tag 1 is an adapter's answer — output, a rendered page, or a refusal. Tag 2 is the scope being
-// accepted, which produces nothing to show.
-pure function arrived(tag: Int, value: String, m: Model) -> Model {
-    if tag == 1 {
-        return Model { source: m.source, result: value, mode: m.mode, bindings: m.bindings };
+pure function update(msg: Msg, m: Model) -> Model allocates {
+    match msg {
+        Edited(text) => {
+            return Model { source: text, gutter: gutter_for(text), mode: m.mode,
+                bindings: m.bindings, console: m.console, preview: m.preview,
+                status: m.status, running: m.running };
+        }
+        Chose(id) => {
+            // A different language is a different answer, so the panes are cleared rather than left
+            // showing the last language's output under a new tab.
+            return Model { source: m.source, gutter: m.gutter, mode: id, bindings: m.bindings,
+                console: "", preview: "", status: "idle", running: false };
+        }
+        Bound(text) => {
+            return Model { source: m.source, gutter: m.gutter, mode: m.mode, bindings: text,
+                console: m.console, preview: m.preview, status: m.status, running: m.running };
+        }
+        Ran => {
+            return Model { source: m.source, gutter: m.gutter, mode: m.mode, bindings: m.bindings,
+                console: m.console, preview: m.preview, status: "running…", running: true };
+        }
+        Stopped => {
+            return Model { source: m.source, gutter: m.gutter, mode: m.mode, bindings: m.bindings,
+                console: m.console, preview: m.preview, status: "stopped", running: false };
+        }
+        Cleared => {
+            return Model { source: m.source, gutter: m.gutter, mode: m.mode, bindings: m.bindings,
+                console: "", preview: "", status: "idle", running: false };
+        }
     }
-    return m;
+}
+
+// **Tag 1 is an answer, tag 2 is the scope being accepted, tag 3 is a stop.** A tag is how a handler
+// tells replies apart, and it is why this component needs no knowledge of what answered.
+pure function commands(msg: Msg, m: Model) -> [StarCmd] allocates {
+    let mutable out: [StarCmd] = [];
+    match msg {
+        Edited(text) => {
+            // The host decides whether an edit runs anything: a language answering in this page is
+            // instant and should feel live, and one that starts a sandbox should not run per keystroke.
+            let a: Int = push(out, StarCmd.Send(1, "/edit/" + m.mode, text));
+            let b: Int = push(out, StarCmd.Store("comet." + m.mode, text));
+        }
+        Chose(id) => {
+            let c: Int = push(out, StarCmd.Send(1, "/edit/" + id, m.source));
+        }
+        Bound(text) => {
+            let d: Int = push(out, StarCmd.Send(2, "/bind/" + m.mode, text));
+            let e: Int = push(out, StarCmd.Send(1, "/edit/" + m.mode, m.source));
+        }
+        Ran => {
+            // **Deliberate, so it never debounces.** Pressing Run means run now, whatever the host
+            // would have done with an edit.
+            let f: Int = push(out, StarCmd.Send(1, "/run/" + m.mode, m.source));
+        }
+        Stopped => {
+            let g: Int = push(out, StarCmd.Send(3, "/stop/" + m.mode, ""));
+        }
+        Cleared => { }
+    }
+    return out;
+}
+
+pure function text_at(value: Json, name: String) -> String {
+    match json_at(value, name) {
+        None => { return ""; }
+        Some(found) => {
+            match json_as_text(found) {
+                None => { return ""; }
+                Some(s) => { return s; }
+            }
+        }
+    }
+}
+
+function arrived(tag: Int, value: String, m: Model) -> Model allocates {
+    if tag != 1 {
+        return m;
+    }
+    // **The envelope is JSON because one string cannot carry four answers.** A console, a rendered
+    // result, an exit code and a duration are different things, and a playground that folded them into
+    // one pane is the playground this replaced.
+    match json_parse(value) {
+        Error(bad) => {
+            return Model { source: m.source, gutter: m.gutter, mode: m.mode, bindings: m.bindings,
+                console: value, preview: "", status: "answered", running: false };
+        }
+        Ok(parsed) => {
+            let kind: String = text_at(parsed, "kind");
+            let body: String = text_at(parsed, "body");
+            let status: String = text_at(parsed, "status");
+            let mutable console: String = body;
+            let mutable preview: String = "";
+            if kind == "html" {
+                // A rendered result goes to the preview pane and the console says so rather than
+                // repeating the markup at somebody.
+                preview = body;
+                console = "";
+            }
+            return Model { source: m.source, gutter: m.gutter, mode: m.mode, bindings: m.bindings,
+                console: console, preview: preview, status: status, running: false };
+        }
+    }
 }
 
 pure function to_text(m: Model) -> String allocates {
     let mutable f: [Field] = [];
     let a: Int = push(f, json_field("source", json_text(m.source)));
-    let b: Int = push(f, json_field("result", json_text(m.result)));
-    let c: Int = push(f, json_field("mode", json_text(m.mode)));
-    let d: Int = push(f, json_field("bindings", json_text(m.bindings)));
+    let b: Int = push(f, json_field("mode", json_text(m.mode)));
+    let c: Int = push(f, json_field("bindings", json_text(m.bindings)));
+    let d: Int = push(f, json_field("console", json_text(m.console)));
+    let e: Int = push(f, json_field("preview", json_text(m.preview)));
+    let g: Int = push(f, json_field("status", json_text(m.status)));
     return json_render(json_object(f));
 }
 
 // **`from_text` FALLS BACK rather than failing**, which is what lets a host mount this with `{}` and
-// still get a usable page. The default mode is the one that needs nothing installed.
-function from_text(text: String) -> Model {
+// still get a usable page.
+function from_text(text: String) -> Model allocates {
     let mutable source: String = "";
-    let mutable result: String = "";
     let mutable mode: String = "bmx";
     let mutable bindings: String = "";
+    let mutable console: String = "";
+    let mutable preview: String = "";
+    let mutable status: String = "idle";
     match json_parse(text) {
         Error(e) => { }
         Ok(v) => {
-            match json_at(v, "source") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { source = s; } } } }
-            match json_at(v, "result") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { result = s; } } } }
-            match json_at(v, "mode") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { mode = s; } } } }
-            match json_at(v, "bindings") { None => { } Some(x) => { match json_as_text(x) { None => { } Some(s) => { bindings = s; } } } }
+            source = text_at(v, "source");
+            let m: String = text_at(v, "mode");
+            if len(m) > 0 { mode = m; }
+            bindings = text_at(v, "bindings");
+            console = text_at(v, "console");
+            preview = text_at(v, "preview");
+            let s: String = text_at(v, "status");
+            if len(s) > 0 { status = s; }
         }
     }
-    return Model { source: source, result: result, mode: mode, bindings: bindings };
+    return Model { source: source, gutter: gutter_for(source), mode: mode, bindings: bindings,
+        console: console, preview: preview, status: status, running: false };
 }
 ===
 
 :props: model: Model
 :!props:
 
-:div: class=comet
-:div: class=comet-bar
-:button: class=comet-tab on:click=Msg.Chose("bmx")
+:div: class="comet card shadow-sm"
+
+:div: class="comet-bar card-header d-flex align-items-center gap-2 flex-wrap"
+:div: class="btn-group btn-group-sm" role=group
+:button: class="comet-tab btn btn-outline-secondary" aria-pressed={{ model.mode == "bmx" }} on:click=Msg.Chose("bmx")
 bmx
 :!button:
-:button: class=comet-tab on:click=Msg.Chose("sbmx")
+:button: class="comet-tab btn btn-outline-secondary" aria-pressed={{ model.mode == "sbmx" }} on:click=Msg.Chose("sbmx")
 sbmx
 :!button:
-:button: class=comet-tab on:click=Msg.Chose("burxt")
+:button: class="comet-tab btn btn-outline-secondary" aria-pressed={{ model.mode == "burxt" }} on:click=Msg.Chose("burxt")
 burxt
 :!button:
 :!div:
+:button: class="comet-run btn btn-sm btn-primary" on:click=Msg.Ran
+Run
+:!button:
+:button: class="comet-stop btn btn-sm btn-outline-danger" on:click=Msg.Stopped
+Stop
+:!button:
+:span: class="comet-status badge text-body-secondary border ms-auto font-monospace"
+{{ model.status }}
+:!span:
+:!div:
 
-:textarea: class=comet-in on:input=Msg.Edited(value)
+:div: class="comet-body card-body"
+
+:div: class="comet-editor"
+:pre: class="comet-gutter"
+{{ model.gutter }}
+:!pre:
+:textarea: class="comet-in form-control font-monospace" spellcheck="false" on:input=Msg.Edited(value)
 {{ model.source }}
 :!textarea:
+:!div:
 
-:pre: class=comet-out
-{{ model.result }}
+:div: class="comet-side"
+:div: class="comet-panel"
+:div: class="comet-label"
+Preview
+:!div:
+:pre: class="comet-preview"
+{{ model.preview }}
 :!pre:
-
-:textarea: class=comet-scope on:input=Msg.Bound(value)
+:!div:
+:div: class="comet-panel"
+:div: class="comet-label"
+Values
+:!div:
+:textarea: class="comet-scope form-control font-monospace" spellcheck="false" on:input=Msg.Bound(value)
 {{ model.bindings }}
 :!textarea:
+:!div:
+:!div:
+
+:!div:
+
+:div: class="comet-console-wrap card-footer"
+:div: class="comet-label d-flex align-items-center"
+:span: class="comet-console-title"
+Console
+:!span:
+:button: class="comet-clear btn btn-sm btn-link text-decoration-none ms-auto py-0" on:click=Msg.Cleared
+Clear
+:!button:
+:!div:
+:pre: class="comet-out font-monospace"
+{{ model.console }}
+:!pre:
+:!div:
+
 :!div:
