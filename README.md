@@ -98,13 +98,13 @@ markup.
 **One command, once everything is built:**
 
 ```sh
-burxt run dev.bx
+burxt run app.bx
 ```
 
 Then open **http://localhost:3000**. That is the whole thing: it builds what is missing, provisions any
 environment that is not ready, starts both servers, and waits — press Enter to stop.
 
-The control plane sits on 3001 and the page finds it there by itself on localhost. `burxt run dev.bx --
+The control plane sits on 3001 and the page finds it there by itself on localhost. `burxt run app.bx --
 <page> <control>` moves either. The first run provisions three container images and takes a few minutes;
 every run after is instant, because an unchanged environment is never rebuilt.
 

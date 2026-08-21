@@ -1,7 +1,12 @@
 // Everything comet needs, running locally, in one command.
 //
-//     burxt build dev.bx -o comet-dev
-//     ./comet-dev
+//     burxt run app.bx
+//
+// **Named `app.bx` on Andre's convention: the default entry point, overridable.** `burxt run` still
+// wants the filename today — there is no zero-argument form and `burxt.package` takes only `name`,
+// `version` and `dependency`, both measured rather than assumed. The convention is relayed to the
+// language session with this file as the caller; naming it now means the command shortens to
+// `burxt run` the day it lands, and nothing here has to move.
 //
 // Starts the control plane and the static server, provisions any environment that is not ready, prints
 // the URLs, and waits. Press Enter and it stops both.
@@ -15,7 +20,7 @@ use "std/http.bx";
 use "std/os.bx";
 
 // **3000 for the page, because that is the port a web developer reaches for.** The control plane sits
-// beside it on 3001. Both overridable: `./comet-dev <page> <control>` — the page first, because that is
+// beside it on 3001. Both overridable: `burxt run app.bx -- <page> <control>` — the page first, because that is
 // the one you open.
 //
 // It was 8080/8000 and then 7788/7789, and the reason for moving twice is worth keeping: this machine
@@ -59,7 +64,7 @@ if !built("./comet-serve", "serve.bx") {
     exit(1);
 }
 if !file_exists("web/comet-engine.wasm") || !file_exists("web/playground.wasm") {
-    print_error("comet-dev: web/comet-engine.wasm or web/playground.wasm is missing. The README's build");
+    print_error("comet: web/comet-engine.wasm or web/playground.wasm is missing. The README's build");
     print_error("           block writes both — the link step is the one people skip.");
     exit(1);
 }
@@ -98,11 +103,11 @@ if !up {
     let k1: Capture = os_capture_status("kill " + control_pid + " " + page_pid + " 2>/dev/null");
     // **Show the log rather than name the file.** The cause is one line long and it was already
     // written down; making somebody go and find it is how a symptom gets mistaken for a diagnosis.
-    print_error("comet-dev: the control plane never answered on " + to_string(control_port) + ":");
+    print_error("comet: the control plane never answered on " + to_string(control_port) + ":");
     if file_exists("/tmp/comet-control.log") {
         print_error("  " + string_trim(file_read("/tmp/comet-control.log")));
     }
-    print_error("  a port in use is the usual reason — try `./comet-dev <control> <page>`");
+    print_error("  a port in use is the usual reason — pass them: `burxt run app.bx -- <page> <control>`");
     exit(1);
 }
 
