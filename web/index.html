@@ -51,7 +51,20 @@
     // serves it, and a Pages embed with no service still works for every language that answers in the
     // browser — which is the whole reason the registry allows both kinds of adapter.
     const params = new URLSearchParams(location.search);
-    const service = params.get('service') || '';
+
+    // **On localhost the control plane is found rather than typed.** `?service=` is how a real embed
+    // names it, and an embed always will — but making somebody paste
+    // `?service=http://localhost:3001` to see their own dev server is friction with no purpose. On a
+    // loopback host with no `?service=`, the page looks for it on the next port up, which is where
+    // `dev.bx` puts it.
+    //
+    // Deliberately localhost-only: guessing a neighbouring port on a real origin would be a page
+    // reaching for a service nobody told it about.
+    const local = location.hostname === 'localhost' || location.hostname === '127.0.0.1';
+    const beside = local && location.port
+      ? `${location.protocol}//${location.hostname}:${Number(location.port) + 1}`
+      : '';
+    const service = params.get('service') || beside;
 
     // **A showcase is a mode and a source, so those are parameters rather than constants.** This is not
     // a test affordance: embedding one showcase on a page about one thing is exactly "open in this

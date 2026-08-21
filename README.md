@@ -98,12 +98,15 @@ markup.
 **One command, once everything is built:**
 
 ```sh
-burxt build dev.bx -o comet-dev && ./comet-dev
+burxt run dev.bx
 ```
 
-Then open **http://localhost:3000**. It starts the control plane and the static server, provisions any
-environment that is not ready, prints the URLs, and waits — press Enter to stop both. The control plane
-is on 3001; pass `./comet-dev <page> <control>` to move either.
+Then open **http://localhost:3000**. That is the whole thing: it builds what is missing, provisions any
+environment that is not ready, starts both servers, and waits — press Enter to stop.
+
+The control plane sits on 3001 and the page finds it there by itself on localhost. `burxt run dev.bx --
+<page> <control>` moves either. The first run provisions three container images and takes a few minutes;
+every run after is instant, because an unchanged environment is never rebuilt.
 
 ## The long way
 
