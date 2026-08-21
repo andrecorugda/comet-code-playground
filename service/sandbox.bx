@@ -30,6 +30,7 @@ use "std/string.bx";
 use "std/json.bx";
 use "std/hash.bx";
 use "std/os.bx";
+use "std/time.bx";
 
 // ---- a declaration ------------------------------------------------------------------------------
 //
@@ -293,10 +294,39 @@ function backend() -> String allocates touches commands, files, input {
 
 // ---- running a command, timed, with the program's own streams kept clean -------------------------
 //
-// **Burxt has no sub-second clock.** `os_now()` answers whole seconds and `time.bx` records why: no
-// milliseconds and no monotonic clock, because both need `clock_gettime`. A console that says
-// "finished in 240ms" needs better than that, so the elapsed time is measured by the shell — and this
-// is a named gap for the language session with that console as its concrete caller.
+// **This shelled out to `date +%s%3N` because `time.bx`'s own header says milliseconds are impossible,
+// and the header is wrong.** `time_wall_micros()` is five hundred lines below the paragraph that says
+// "no milliseconds, no monotonic clock … blocked on A7" — it turned out A7 was not needed, and the file
+// reassembles a `struct timespec` from `c_bytes_at` by hand. The language session found it after I sent
+// them a request for a clock they had already shipped, and called it the most expensive stale claim
+// their repository has produced: **a present-tense sentence in shipped documentation, contradicted by
+// code in the same file, that talked a consumer out of the language and into the shell.**
+//
+// I read that paragraph and quoted it in a commit message. Measured before believing the correction:
+// 322ms across a 250ms sleep, which is the sleep plus a process spawn.
+//
+// **It is a WALL clock and that is a real caveat rather than a hedge.** It can step backwards when the
+// machine's time is corrected, so a duration spanning an NTP step can come out negative. For a status
+// badge and a run record the numbers are honest; a timeout that must never go backwards is still
+// genuinely blocked, because `CLOCK_MONOTONIC` is 1 on Linux and 6 on macOS and Burxt has no
+// conditional compilation. So a negative elapsed time is clamped to zero — a duration is never
+// negative, and the clock stepping is not something this can report usefully.
+function elapsed_ms(from: Int, to: Int) -> Int {
+    let span: Int = divide_floor(to - from, 1000);
+    if span < 0 {
+        return 0;
+    }
+    return span;
+}
+
+function micros_now() -> Int touches clock {
+    match time_wall_micros() {
+        Some(us) => { return us; }
+        // `None` is the clock refusing to be read, which is a different fact from zero — 1970 is a real
+        // instant a subtraction would happily accept.
+        None => { return 0 - 1; }
+    }
+}
 //
 // The shape matters for a reason beyond timing: **the program's stdout and stderr go to files, and only
 // the exit code and the elapsed milliseconds come back on stdout.** If they shared a stream, a program
@@ -304,19 +334,22 @@ function backend() -> String allocates touches commands, files, input {
 // program is exactly the thing that would.
 class Timed { exit: Int, ms: Int, stdout: String, stderr: String }
 
-function timed(command: String, scratch: String) -> Timed allocates touches commands, files, input {
+function timed(command: String, scratch: String) -> Timed allocates touches commands, files, input, clock {
     let out_path: String = scratch + "/stdout";
     let err_path: String = scratch + "/stderr";
-    let ran: Capture = os_capture_status(
-        "s=$(date +%s%3N); " + command
+    let started: Int = micros_now();
+    let ran: Capture = os_capture_status(command
         + " >" + quoted(out_path) + " 2>" + quoted(err_path) + "; rc=$?;"
-        + " e=$(date +%s%3N); printf '%s %s\\n' \"$rc\" \"$((e-s))\"");
+        + " printf '%s\\n' \"$rc\"");
+    let ended: Int = micros_now();
     let mutable exit_code: Int = 0 - 1;
     let mutable ms: Int = 0;
+    if started >= 0 && ended >= 0 {
+        ms = elapsed_ms(started, ended);
+    }
     let parts: [String] = string_split(string_trim(ran.output), " ");
-    if len(parts) >= 2 {
+    if len(parts) >= 1 {
         exit_code = string_to_int(parts[0], 0 - 1);
-        ms = string_to_int(parts[1], 0);
     }
     let mutable stdout_text: String = "";
     let mutable stderr_text: String = "";
@@ -503,7 +536,7 @@ function provision(d: Declaration, scratch: String) -> Provisioned
 // has to die. Exit 124 is `timeout`'s way of saying it did the killing, which is why that code is read
 // as a deadline rather than as the program's answer.
 function run_docker(d: Declaration, reference: String, work: String, scratch: String) -> Outcome
-        allocates touches commands, files, input {
+        allocates touches commands, files, input, clock {
     let seconds: Int = seconds_for(d.timeout_ms);
     let memory: Int = d.vcpus * 2048;
     let slash: Int = string_rfind(scratch, "/");
@@ -526,8 +559,7 @@ function run_docker(d: Declaration, reference: String, work: String, scratch: St
     // program's real exit code rather than the CLI's. Every literal brace in that format string is
     // `\{`, because an unescaped one is an interpolation to this compiler.
     let script: String =
-        "s=$(date +%s%3N); "
-        + "docker run -d --name " + quoted(name) + " --network=none --read-only"
+        "docker run -d --name " + quoted(name) + " --network=none --read-only"
         + " --tmpfs /tmp:rw,exec,size=64m"
         + " --memory " + to_string(memory) + "m --cpus " + to_string(d.vcpus)
         + " --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges"
@@ -540,17 +572,21 @@ function run_docker(d: Declaration, reference: String, work: String, scratch: St
         + "rc=$(docker inspect -f '\{\{.State.ExitCode\}\}' " + quoted(name)
         + " 2>/dev/null || echo -1); "
         + "docker rm -f " + quoted(name) + " >/dev/null 2>&1; "
-        + "e=$(date +%s%3N); printf '%s %s %s\\n' \"$to\" \"$rc\" \"$((e-s))\"";
+        + "printf '%s %s\\n' \"$to\" \"$rc\"";
 
+    let started: Int = micros_now();
     let ran: Capture = os_capture_status(script);
+    let ended: Int = micros_now();
     let parts: [String] = string_split(string_trim(ran.output), " ");
     let mutable killed: Bool = false;
     let mutable exit_code: Int = 0 - 1;
     let mutable ms: Int = 0;
-    if len(parts) >= 3 {
+    if started >= 0 && ended >= 0 {
+        ms = elapsed_ms(started, ended);
+    }
+    if len(parts) >= 2 {
         killed = parts[0] == "1";
         exit_code = string_to_int(parts[1], 0 - 1);
-        ms = string_to_int(parts[2], 0);
     }
     let mutable stdout_text: String = "";
     let mutable stderr_text: String = "";
@@ -569,7 +605,7 @@ function run_docker(d: Declaration, reference: String, work: String, scratch: St
 }
 
 function run_vercel(d: Declaration, reference: String, work: String, scratch: String) -> Outcome
-        allocates touches commands, files, input {
+        allocates touches commands, files, input, clock {
     let seconds: Int = seconds_for(d.timeout_ms);
     // The scratch directory's own name is already unique, so it is the run's name too — no randomness
     // needed, and Burxt has no `Math.random` to reach for anyway.
@@ -617,7 +653,7 @@ function run_vercel(d: Declaration, reference: String, work: String, scratch: St
 
 // The whole of a run: a private directory, the visitor's source in it, the backend, and the answer.
 function run_source(d: Declaration, reference: String, source: String) -> Outcome
-        allocates touches commands, files, input {
+        allocates touches commands, files, input, clock {
     if !d.ok {
         return Outcome { ok: false, stdout: "", stderr: "", exit: 0 - 1, ms: 0, timed_out: false,
             why: d.why };
