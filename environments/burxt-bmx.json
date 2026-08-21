@@ -1,0 +1,26 @@
+{
+  "id": "burxt-bmx",
+  "label": "BMX",
+  "image": "ubuntu:24.04",
+  "files": {
+    "burxt.package": "name        comet-showcase\nversion     0.1.0\n\ndependency  bmx   https://github.com/andrecorugda/bmx   burxt-0.12.1\n",
+    "render.bx": "// Renders a BMX document with BMX's own implementation, in Burxt.\n//\n// Compiled into the image at provision, so a run is one process starting rather than a compile. The\n// visitor's document arrives at /work/document.bmx and the rendered page goes to stdout; a refusal\n// carries BMX's own code, which is the whole point of asking the format's implementation rather than a\n// reimplementation of it.\nuse \"bmx/burxt/bmx.bx\";\nuse \"std/files.bx\";\nuse \"std/os.bx\";\n\nlet path: String = os_arg(1);\nlet mutable binds: [Binding] = [];\nmatch bmx_to_html(file_read(path), binds) {\n    Ok(html) => { print(html); }\n    Error(why) => {\n        print_error(why);\n        exit(1);\n    }\n}\n"
+  },
+  "install": [
+    "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gcc libc6-dev git && rm -rf /var/lib/apt/lists/*",
+    "curl -fsSL https://github.com/andrecorugda/burxt/releases/download/v1.7.0/burxt-1.7.0-linux-x86_64.tar.gz -o /tmp/b.tgz",
+    "mkdir -p /tmp/b /usr/local/lib/burxt && tar xzf /tmp/b.tgz -C /tmp/b --strip-components=1 && install -m 755 /tmp/b/burxt /usr/local/bin/burxt && install -m 644 /tmp/b/lib/*.bx /usr/local/lib/burxt/ && rm -rf /tmp/b /tmp/b.tgz"
+  ],
+  "bootstrap": [
+    "burxt fetch",
+    "burxt build render.bx -o /usr/local/bin/bmx-render"
+  ],
+  "file": "document.bmx",
+  "run": [
+    "bmx-render",
+    "/work/document.bmx"
+  ],
+  "timeout_ms": 10000,
+  "vcpus": 1,
+  "sample": "# Receipt A-1042\n\nThank you, **Ada**. Your total is `\u00a349.00`.\n"
+}

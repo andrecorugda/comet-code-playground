@@ -9,7 +9,12 @@
   ],
   "bootstrap": [],
   "file": "main.bx",
-  "run": ["burxt", "run", "/work/main.bx"],
+  "run": [
+    "burxt",
+    "run",
+    "/work/main.bx"
+  ],
   "timeout_ms": 10000,
-  "vcpus": 1
+  "vcpus": 1,
+  "sample": "print(\"hello from a sandbox\");\n"
 }

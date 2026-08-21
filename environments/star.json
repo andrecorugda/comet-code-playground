@@ -1,0 +1,26 @@
+{
+  "id": "star",
+  "label": "star",
+  "image": "ubuntu:24.04",
+  "files": {
+    "burxt.package": "name        comet-showcase\nversion     0.1.0\n\ndependency  star  https://github.com/andrecorugda/star-burxt  v0.2.0\ndependency  bmx   https://github.com/andrecorugda/bmx         burxt-0.12.1\n",
+    "check.bx": "// Judges a star document, all three layers, through star's PUBLIC surface.\n//\n// **Not star's own `examples/check.bx`, and the reason is a real constraint worth knowing.** Building a\n// dependency's tool from inside its checkout fails: the compiler walks up from that file, finds STAR's\n// `burxt.package`, and looks for star's own `.burxt/` \u2014 which does not exist in a consumer's tree.\n// `use \"bmx/burxt/bmx.bx\" needs the dependency bmx, and it has not been fetched` is what that looks\n// like, and no amount of fetching in /work fixes it. **A package's tools are not buildable from a\n// consumer's checkout.**\n//\n// So this uses the six names star publishes, which is what they are published for. Three layers:\n//\n//   1. star's own rules      star_generate refuses with a STAR-Ennn or a BMX-Ennn\n//   2. the component         star_source_of gives the Burxt the document became\n//   3. the compiler          which is the layer that makes star worth using at all\nuse \"star/star.bx\";\nuse \"std/files.bx\";\nuse \"std/os.bx\";\n\nif os_arg_count() < 2 {\n    print_error(\"usage: star-check <document.sbmx>\");\n    exit(2);\n}\nlet path: String = os_arg(1);\nmatch star_generate(file_read(path), \"showcase\", []) {\n    Error(why) => {\n        print_error(why);\n        exit(1);\n    }\n    Ok(built) => {\n        let component: String = star_source_of(built, \"showcase\");\n        let wrote: Int = file_write(\"/work/showcase.bx\", component);\n        if wrote < 0 {\n            print_error(\"the document generated, but the component could not be written\");\n            exit(2);\n        }\n        // **The third layer, and the one a reader is really asking about.** A document can satisfy\n        // star's rules and still produce a component the compiler refuses \u2014 a handler whose types do\n        // not line up, a slot naming a field that is not there. That refusal is the answer.\n        let judged: Capture = os_capture_status(\"burxt check /work/showcase.bx 2>&1\");\n        if judged.code != 0 {\n            print_error(judged.output + judged.errors);\n            exit(1);\n        }\n        print(\"this document generates a component the compiler accepts.\");\n        print(\"\");\n        print(component);\n    }\n}\n"
+  },
+  "install": [
+    "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gcc libc6-dev git && rm -rf /var/lib/apt/lists/*",
+    "curl -fsSL https://github.com/andrecorugda/burxt/releases/download/v1.7.0/burxt-1.7.0-linux-x86_64.tar.gz -o /tmp/b.tgz",
+    "mkdir -p /tmp/b /usr/local/lib/burxt && tar xzf /tmp/b.tgz -C /tmp/b --strip-components=1 && install -m 755 /tmp/b/burxt /usr/local/bin/burxt && install -m 644 /tmp/b/lib/*.bx /usr/local/lib/burxt/ && rm -rf /tmp/b /tmp/b.tgz"
+  ],
+  "bootstrap": [
+    "burxt fetch",
+    "burxt build check.bx -o /usr/local/bin/star-check"
+  ],
+  "file": "Showcase.sbmx",
+  "run": [
+    "star-check",
+    "/work/Showcase.sbmx"
+  ],
+  "timeout_ms": 25000,
+  "vcpus": 1,
+  "sample": ":props: amount: Int, tone: String\n:!props:\n\n:span: class=badge\n{{ tone }}: {{ to_string(amount) }}\n:!span:\n"
+}

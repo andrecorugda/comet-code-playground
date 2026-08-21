@@ -40,10 +40,29 @@ class Declaration {
     image: String,
     install: [String],
     bootstrap: [String],
+    // Files placed in the image BEFORE install and bootstrap run, as `name` then `content` in pairs.
+    //
+    // **Both remaining environments need this and neither could be written without it.** Burxt+BMX needs
+    // a `burxt.package` declaring the dependency before `burxt fetch` has anything to fetch, and it
+    // needs a small renderer compiled into the image. star needs the same manifest plus its own tools
+    // built. Cramming a multi-line program into a shell heredoc inside a JSON string is possible and
+    // unreadable; a file is a file.
+    //
+    // Flat pairs rather than a map because a growable array cannot hold another array here, and a class
+    // per entry would buy nothing over reading two at a time.
+    files: [String],
     file: String,
     argv: [String],
     timeout_ms: Int,
     vcpus: Int,
+    // A source that MUST run in this environment, exit 0. Not part of the digest — it changes nothing
+    // about the image — and not optional either: `tests/service.bx` runs every declaration's sample, so
+    // an environment cannot be added to this repository without an example that works in it.
+    //
+    // **That is the accepting case, made structural.** A suite of refusals is satisfied by a sandbox
+    // that refuses everything, and an environment nobody has ever run a program in is exactly the shape
+    // that passes every security check and serves nothing.
+    sample: String,
     // sha256 of the fields that DECIDE THE IMAGE — image, install, bootstrap — and nothing else.
     //
     // **The first version hashed the whole declaration and writing the deadline test found it wrong.**
@@ -168,8 +187,8 @@ function read_declaration(path: String) -> Declaration allocates touches files, 
     let mutable no_argv: [String] = [];
     if !file_exists(path) {
         return Declaration { id: "", label: "", image: "", install: empty, bootstrap: empty,
-            file: "", argv: no_argv, timeout_ms: 0, vcpus: 0, digest: "", ok: false,
-            why: "no declaration at " + path };
+            files: empty, file: "", argv: no_argv, timeout_ms: 0, vcpus: 0, sample: "",
+            digest: "", ok: false, why: "no declaration at " + path };
     }
     let text: String = file_read(path);
     let mutable value: Json = Json.Null;
@@ -177,8 +196,8 @@ function read_declaration(path: String) -> Declaration allocates touches files, 
         Ok(parsed) => { value = parsed; }
         Error(bad) => {
             return Declaration { id: "", label: "", image: "", install: empty, bootstrap: empty,
-                file: "", argv: no_argv, timeout_ms: 0, vcpus: 0, digest: "", ok: false,
-                why: path + " does not parse: " + bad };
+                files: empty, file: "", argv: no_argv, timeout_ms: 0, vcpus: 0, sample: "",
+                digest: "", ok: false, why: path + " does not parse: " + bad };
         }
     }
 
@@ -188,6 +207,22 @@ function read_declaration(path: String) -> Declaration allocates touches files, 
     let b1: Int = strings_of(field_of(value, "bootstrap"), bootstrap);
     let mutable argv: [String] = [];
     let a1: Int = strings_of(field_of(value, "run"), argv);
+    let mutable files: [String] = [];
+    match field_of(value, "files") {
+        Object(entries) => {
+            let mutable f: Int = 0;
+            while f < len(entries) {
+                let n: Int = push(files, entries[f].name);
+                let c: Int = push(files, text_of(entries[f].value));
+                f += 1;
+            }
+        }
+        Null => { files = files; }
+        Truth(b) => { files = files; }
+        Number(n) => { files = files; }
+        Text(s) => { files = files; }
+        List(items) => { files = files; }
+    }
 
     let id: String = text_of(field_of(value, "id"));
     let file: String = text_of(field_of(value, "file"));
@@ -201,6 +236,10 @@ function read_declaration(path: String) -> Declaration allocates touches files, 
     if len(argv) == 0 && len(why) == 0 {
         why = path + " declares no `run`, so nothing would happen";
     }
+    if len(text_of(field_of(value, "sample"))) == 0 && len(why) == 0 {
+        why = path + " declares no `sample`, so nothing proves a program can run in it. An environment"
+            + " with no working example passes every security check and serves nobody";
+    }
 
     let mutable label: String = text_of(field_of(value, "label"));
     if len(label) == 0 {
@@ -213,14 +252,16 @@ function read_declaration(path: String) -> Declaration allocates touches files, 
 
     return Declaration {
         id: id, label: label, image: image,
-        install: install, bootstrap: bootstrap,
+        install: install, bootstrap: bootstrap, files: files,
         file: file, argv: argv,
         timeout_ms: int_of(field_of(value, "timeout_ms"), 10000),
         vcpus: int_of(field_of(value, "vcpus"), 1),
+        sample: text_of(field_of(value, "sample")),
         // Only what the image is built from. `image` cannot contain a newline and the steps are joined
         // with one, so two different declarations cannot collide by rearranging their boundaries.
         digest: substring(hash_hex(sha256_text(
-            image + "\n" + string_join(install, "\n") + "\n--\n" + string_join(bootstrap, "\n"))), 0, 12),
+            image + "\n" + string_join(install, "\n") + "\n--\n" + string_join(bootstrap, "\n")
+            + "\n--\n" + string_join(files, "\n"))), 0, 12),
         ok: len(why) == 0,
         why: why,
     };
@@ -310,6 +351,14 @@ pure function dockerfile_for(d: Declaration) -> String allocates {
         i += 1;
     }
     out = out + "WORKDIR /work\n";
+    // **Install, then files, then bootstrap — and the order is about caching, not taste.** A toolchain
+    // changes rarely and a project manifest changes often, so copying files before the install steps
+    // would throw away the expensive layer every time a dependency line moved.
+    let mutable f: Int = 0;
+    while f + 1 < len(d.files) {
+        out = out + "COPY " + d.files[f] + " /work/" + d.files[f] + "\n";
+        f += 2;
+    }
     let mutable b: Int = 0;
     while b < len(d.bootstrap) {
         // **Bootstrap runs with the network on, at build time.** This is what makes star's playground
@@ -331,6 +380,16 @@ function provision_docker(d: Declaration, scratch: String) -> Provisioned
     if known.code == 0 {
         return Provisioned { ok: true, reference: tag, digest: d.digest,
             why: "already built for this declaration" };
+    }
+    // The files go into the build context under their own names, which is what `COPY` above expects.
+    let mutable f: Int = 0;
+    while f + 1 < len(d.files) {
+        let put: Int = file_write(scratch + "/" + d.files[f], d.files[f + 1]);
+        if put < 0 {
+            return Provisioned { ok: false, reference: "", digest: d.digest,
+                why: "cannot stage `" + d.files[f] + "` into the build context" };
+        }
+        f += 2;
     }
     let path: String = scratch + "/Dockerfile";
     let wrote: Int = file_write(path, dockerfile_for(d));
@@ -359,6 +418,28 @@ function provision_vercel(d: Declaration, scratch: String) -> Provisioned
         return Provisioned { ok: false, reference: "", digest: d.digest,
             why: "vercel sandbox create failed: " + string_trim(made.output + made.errors) };
     }
+    // Copied in after the sandbox exists and before anything runs, which is the same order the
+    // Dockerfile uses for the same reason.
+    let mutable f: Int = 0;
+    while f + 1 < len(d.files) {
+        let local: String = scratch + "/" + d.files[f];
+        let put: Int = file_write(local, d.files[f + 1]);
+        if put < 0 {
+            let gone: Capture = os_capture_status("vercel sandbox remove " + quoted(name) + " 2>&1");
+            return Provisioned { ok: false, reference: "", digest: d.digest,
+                why: "cannot stage `" + d.files[f] + "` locally before copying it in" };
+        }
+        let copied: Capture = os_capture_status("vercel sandbox copy " + quoted(local) + " "
+            + quoted(name + ":/work/" + d.files[f]) + " 2>&1");
+        if copied.code != 0 {
+            let gone: Capture = os_capture_status("vercel sandbox remove " + quoted(name) + " 2>&1");
+            return Provisioned { ok: false, reference: "", digest: d.digest,
+                why: "copying `" + d.files[f] + "` in failed: "
+                    + string_trim(copied.output + copied.errors) };
+        }
+        f += 2;
+    }
+
     let mutable steps: [String] = [];
     let mutable i: Int = 0;
     while i < len(d.install) {

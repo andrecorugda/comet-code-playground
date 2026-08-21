@@ -175,6 +175,48 @@ let x10: Int = check(tally,
     "the writing run said " + first_line(leaving.stdout) + " and the looking run said "
         + first_line(looking.stdout));
 
+// ---- every environment this repository ships, and its own sample ---------------------------------
+//
+// **The list comes from the directory, not from here.** An environment added tomorrow is covered without
+// anyone remembering to add it, and it cannot be added without a `sample` — `read_declaration` refuses a
+// declaration that has none, because an environment nobody has ever run a program in passes every
+// security check above and serves nobody.
+let listing: Capture = os_capture_status("ls environments/*.json 2>/dev/null");
+let declarations: [String] = string_lines(listing.output);
+let mutable seen: Int = 0;
+let mutable e: Int = 0;
+while e < len(declarations) {
+    let path: String = string_trim(declarations[e]);
+    if len(path) > 0 {
+        let env: Declaration = read_declaration(path);
+        if !env.ok {
+            let bad: Int = check(tally, false, path + " reads", env.why);
+        } else {
+            seen += 1;
+            print("  ..    " + env.label + ": provisioning and running its sample");
+            let ready: Provisioned = provision(env, scratch);
+            if !ready.ok {
+                let failed: Int = check(tally, false,
+                    env.label + " provisions", ready.why);
+            } else {
+                let sample: Outcome = run_source(env, ready.reference, env.sample);
+                let x: Int = check(tally, sample.exit == 0 && !sample.timed_out,
+                    env.label + " runs its own sample (" + to_string(sample.ms) + "ms, "
+                        + to_string(len(sample.stdout)) + " bytes out)",
+                    "exit=" + to_string(sample.exit) + " " + sample.why
+                        + " stdout=" + first_line(sample.stdout)
+                        + " stderr=" + first_line(sample.stderr));
+            }
+        }
+    }
+    e += 1;
+}
+// **Zero environments is not a pass**, and a `ls` that stopped matching is exactly what it would look
+// like.
+let x_env: Int = check(tally, seen >= 3,
+    to_string(seen) + " environments ship here, and each ran its own sample",
+    "only " + to_string(seen) + " declarations were found, so the sweep is not reaching them");
+
 // ---- the service, over a real socket ------------------------------------------------------------
 //
 // **The client is Burxt talking to Burxt, and `127.0.0.1` is why it can be.** `http_get` takes four
@@ -242,6 +284,22 @@ if up {
         }
         Error(why) => {
             let x14: Int = check(tally, false, "a traversal is refused", why);
+        }
+    }
+
+    // **Provisioned through the ENDPOINT, because that is what records the reference.** Calling
+    // `provision` directly above builds the image but writes no state, so `/run` correctly answers 409.
+    // This check passed for a while on state a manual `curl` had left behind — an assertion a leftover
+    // can satisfy is not an assertion, and deleting the directory is what exposed it.
+    match http_post(127, 0, 0, 1, port, "127.0.0.1", "/provision", "application/json",
+            "\{\"env\":\"burxt\"\}") {
+        Ok(reply) => {
+            let xp: Int = check(tally, reply.status == 200 && contains(reply.body, "reference"),
+                "POST /provision records the reference a run needs",
+                "status " + to_string(reply.status) + ": " + first_line(reply.body));
+        }
+        Error(why) => {
+            let xp: Int = check(tally, false, "POST /provision answers", why);
         }
     }
 
