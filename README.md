@@ -101,6 +101,7 @@ burxt build serve.bx -o comet-serve               # the local server
 
 # the interface. star-build comes from the star repository and is not on PATH by default
 PATH="$HOME/star-burxt:$PATH" star-build Playground.sbmx playground build
+cp build/playground.wasm web/playground.wasm        # ...and the page fetches it from web/
 
 # the engine, in two steps — the second is the one that writes what the page actually fetches
 burxt build entry.bx --target wasm32-unknown-unknown -o build/entry.o
@@ -114,7 +115,16 @@ LLD=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/rust-lld | head -1)
 node tests/browser.mjs                            # checks it in a real browser
 ```
 
-**Three things in that block used to be wrong, and each one only a reader would have found.**
+**Four things in that block used to be wrong, and each one only a reader would have found.**
+
+Two of them were the same defect one file apart: **the block never wrote either artefact the page
+actually fetches.** `web/engine.js` fetches `comet-engine.wasm` and `web/comet.js` fetches
+`playground.wasm`; the block stopped at `build/entry.o` for the first and wrote `build/playground.wasm`
+for the second. Both files are committed on purpose — the site serves them, and a page that needs a build
+step to be viewable is a page nobody views — which is exactly what hides this: follow the steps, and the
+committed artefacts stay in place while the page mounts and works. **Nothing you just compiled is being
+exercised, and it looks identical to everything working.** Proved by deleting both and following the
+block: `comet-engine.wasm` came back, `playground.wasm` did not.
 
 It stopped at `build/entry.o` and never linked it. `web/engine.js` fetches `comet-engine.wasm`, so
 following the documented steps left the committed module in place and the page looked fine while testing
