@@ -1,3 +1,6 @@
+// not-burxt: platform — patches the live DOM against the vdom a component returned, so it touches
+//            `document` on every line. The DOM is the browser's, and reaching it needs the browser's
+//            language until Burxt targets wasm with a host binding for it
 // star-burxt's DOM reconciler.
 //
 // This is the one place in the driver that does more than hand bytes over, and it

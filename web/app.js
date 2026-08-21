@@ -1,3 +1,8 @@
+// not-burxt: platform — the host that mounts a star component IN the browser: it instantiates the
+//            wasm, walks the vdom the component returns, and dispatches `data-star-h` indices back into
+//            it. Every decision is the component's; this moves values across the boundary. Burxt has no
+//            wasm backend, so the code on the browser side of that boundary cannot be Burxt — and that
+//            is one decision away from changing, which is why this says platform and not vendored
 // star-burxt's driver: the part JavaScript has to do, and nothing else.
 //
 // **This file holds no application logic.** Copy it once per project and leave it alone.

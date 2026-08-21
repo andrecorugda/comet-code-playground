@@ -1,0 +1,352 @@
+// The playground, in a real browser.
+//
+//     burxt build tests/browser.bx -o comet-browser
+//     timeout 90 ./comet-browser
+//     timeout 90 ./comet-browser --prove-it     # the negative control
+//
+// **A claim about a browser is checked in a browser.** Everything under this repository could be
+// asserted without one — the wasm instantiates, the generator answers, `render` escapes — and all of it
+// would still be worthless if the page could not mount. BMX shipped exactly that: `reference/bmx.js`
+// passed its whole conformance suite in node while a bare `process.argv[1]` made the module
+// unimportable in a browser, so it threw `ReferenceError: process is not defined` before one export was
+// reachable. Their portability test was *named* for the question and asked a narrower one.
+//
+// ---- this was 146 lines of JavaScript, and the reason it could be Burxt -------------------------
+//
+// The shape looked node-shaped: serve the page, launch a browser, receive the page's own report, resolve
+// when it arrives. Two of those three are why it looked impossible, and both were wrong.
+//
+// **Chrome is a BINARY.** It was already driven as one here — `--headless` and a URL, no puppeteer,
+// because a sibling needed puppeteer as a module and could not run on this machine. `os_capture_status`
+// launches a binary.
+//
+// **And `HttpResponse.body` being a `String` does not rule out serving a `.wasm`.** A Burxt String is
+// UTF-8, so that reads as a type-level no. The validation lives at `file_read`, which refuses non-text
+// at the door; `from_bytes` takes arbitrary bytes, 0x00 and 0xFF included, and nothing downstream
+// re-checks. Measured before this was written: an 83,629-byte module served through `http_serve` and
+// fetched back with a matching sha256, which also exercises `net_write`'s partial-write path. **Do not
+// infer a missing capability from a type.**
+//
+// ---- the one thing that is genuinely different from the JavaScript -----------------------------
+//
+// node served the page and received the report in ONE process, because its server is asynchronous.
+// `http_serve_one` blocks on `accept`, so this cannot. **That turns out to be the right shape rather
+// than a limitation:** Chrome is launched into the background first, and then this blocks on accept in a
+// loop until the page POSTs to `/report`. The browser is in another process, which is the same
+// arrangement the JavaScript's own comment says a shell would give it — and star's gallery hit the
+// mirror image, where a synchronous child inside the serving process deadlocked and sixteen timeouts all
+// looked like pages that would not settle.
+//
+// **The report arrives through a file rather than a variable**, because a `Handler` method cannot take a
+// `mutable` parameter and cannot mutate `self`. The handler writes the POST body where the loop can see
+// it. That is a smaller price than it sounds: it also means a run that dies mid-report leaves the
+// evidence on disk.
+//
+// **The deadline belongs to the caller.** `accept` blocks forever if Chrome dies without reporting, so
+// this is invoked under `timeout`, exactly as star's `drive-lsp.bx` invokes the language server. A
+// passing check that never returns is indistinguishable from a broken one — the JavaScript learned that
+// when `server.close()` waited on keep-alive sockets a headless browser holds open indefinitely.
+use "std/files.bx";
+use "std/string.bx";
+use "std/json.bx";
+use "std/http.bx";
+use "std/net.bx";
+use "std/os.bx";
+
+class Site { root: String, report: String }
+
+pure function content_type(path: String) -> String {
+    if string_ends_with(path, ".html") { return "text/html; charset=utf-8"; }
+    if string_ends_with(path, ".js") { return "text/javascript; charset=utf-8"; }
+    if string_ends_with(path, ".mjs") { return "text/javascript; charset=utf-8"; }
+    if string_ends_with(path, ".css") { return "text/css; charset=utf-8"; }
+    // **A wasm served as octet-stream fails in the browser and not here.**
+    // `WebAssembly.instantiateStreaming` refuses anything that is not `application/wasm`, so a wrong
+    // content type is a page that loads and a module that never instantiates.
+    if string_ends_with(path, ".wasm") { return "application/wasm"; }
+    return "application/octet-stream";
+}
+
+implement Handler for Site {
+    function (self) handle(request: HttpRequest) -> HttpResponse allocates touches files {
+        let mutable headers: [HttpHeader] = [];
+        if request.path == "/report" {
+            let wrote: Int = file_write(self.report, request.body);
+            return HttpResponse { status: 204, headers: headers, body: "" };
+        }
+        let mutable path: String = request.path;
+        if string_starts_with(path, "/") {
+            path = substring(path, 1, len(path) - 1);
+        }
+        if len(path) == 0 {
+            path = "index.html";
+        }
+        if string_find(path, "..") >= 0 {
+            return HttpResponse { status: 403, headers: headers, body: "no" };
+        }
+        match file_read_bytes(self.root + "/" + path) {
+            None => {
+                return HttpResponse { status: 404, headers: headers, body: "no" };
+            }
+            Some(bytes) => {
+                let h: Int = push(headers,
+                    HttpHeader { name: "content-type", value: content_type(path) });
+                return HttpResponse { status: 200, headers: headers, body: from_bytes(bytes) };
+            }
+        }
+    }
+}
+
+class Tally { ran: Int, broken: Int }
+
+function check(mutable tally: Tally, ok: Bool, name: String, detail: String) -> Int {
+    tally.ran += 1;
+    if ok {
+        print("  ok    " + name);
+        return 0;
+    }
+    tally.broken += 1;
+    print("  FAIL  " + name);
+    print("        " + detail);
+    return 1;
+}
+
+// A CI runner has one on PATH; this machine has them in a cache. Both, because a tool that only works
+// where it was written is a tool nobody else runs.
+function find_chrome() -> String allocates touches commands, files, input {
+    let mutable names: [String] = [];
+    let a: Int = push(names, "google-chrome");
+    let b: Int = push(names, "chromium");
+    let c: Int = push(names, "chromium-browser");
+    let mutable i: Int = 0;
+    while i < len(names) {
+        let found: Capture = os_capture_status("command -v " + names[i] + " 2>/dev/null");
+        let path: String = string_trim(found.output);
+        if found.code == 0 && len(path) > 0 {
+            return path;
+        }
+        i += 1;
+    }
+    let cached: Capture = os_capture_status(
+        "ls -d \"$HOME\"/.cache/puppeteer/chrome/*/chrome-linux64/chrome"
+        + " \"$HOME\"/.cache/puppeteer/chrome/*/chrome-linux/chrome 2>/dev/null | sort -r | head -1");
+    return string_trim(cached.output);
+}
+
+pure function field_of(value: Json, name: String) -> Json {
+    match value {
+        Object(fields) => {
+            let mutable i: Int = 0;
+            while i < len(fields) {
+                if fields[i].name == name {
+                    return fields[i].value;
+                }
+                i += 1;
+            }
+            return Json.Null;
+        }
+        Null => { return Json.Null; }
+        Truth(b) => { return Json.Null; }
+        Number(n) => { return Json.Null; }
+        Text(s) => { return Json.Null; }
+        List(items) => { return Json.Null; }
+    }
+}
+
+pure function text_of(value: Json) -> String {
+    match value {
+        Text(s) => { return s; }
+        Null => { return ""; }
+        Truth(b) => { return ""; }
+        Number(n) => { return n; }
+        List(items) => { return ""; }
+        Object(f) => { return ""; }
+    }
+}
+
+pure function truth_of(value: Json) -> Bool {
+    match value {
+        Truth(b) => { return b; }
+        Null => { return false; }
+        Number(n) => { return false; }
+        Text(s) => { return false; }
+        List(items) => { return false; }
+        Object(f) => { return false; }
+    }
+}
+
+function names_in(value: Json, mutable into: [String]) -> Int {
+    match value {
+        List(items) => {
+            let mutable i: Int = 0;
+            while i < len(items) {
+                let x: Int = push(into, text_of(items[i]));
+                i += 1;
+            }
+            return len(items);
+        }
+        Null => { return 0; }
+        Truth(b) => { return 0; }
+        Number(n) => { return 0; }
+        Text(s) => { return 0; }
+        Object(f) => { return 0; }
+    }
+}
+
+pure function has(list: [String], want: String) -> Bool {
+    let mutable i: Int = 0;
+    while i < len(list) {
+        if list[i] == want {
+            return true;
+        }
+        i += 1;
+    }
+    return false;
+}
+
+pure function contains(haystack: String, needle: String) -> Bool {
+    return string_find(haystack, needle) >= 0;
+}
+
+let prove: Bool = os_arg_count() > 1 && os_arg(1) == "--prove-it";
+let show: Bool = os_arg_count() > 1 && os_arg(1) == "--show";
+
+let binary: String = find_chrome();
+if len(binary) == 0 {
+    print("  no Chrome found — a claim about a browser cannot be checked without one");
+    exit(1);
+}
+
+let mutable report_path: String = "";
+match file_temp_directory("comet-browser") {
+    None => {
+        print_error("cannot make a temporary directory");
+        exit(2);
+    }
+    Some(dir) => { report_path = dir + "/report.json"; }
+}
+
+// An ephemeral port, so two runs cannot collide and nothing has to guess.
+let mutable listener: Int = 0 - 1;
+match net_listen_any_port(16) {
+    None => {
+        print_error("cannot listen on any port");
+        exit(2);
+    }
+    Some(fd) => { listener = fd; }
+}
+let mutable port: Int = 0;
+match net_port_of(listener) {
+    None => {
+        print_error("cannot read the port back off the socket");
+        exit(2);
+    }
+    Some(p) => { port = p; }
+}
+
+let site: Site = Site { root: "web", report: report_path };
+let handler: dynamic Handler = site;
+
+// Chrome first, into the background, because everything below blocks on accept.
+let url: String = "http://127.0.0.1:" + to_string(port) + "/index.html";
+let launched: Capture = os_capture_status(file_quote(binary)
+    + " --headless --disable-gpu --no-sandbox --disable-dev-shm-usage "
+    + file_quote(url) + " >/dev/null 2>&1 & echo $!");
+let chrome_pid: String = string_trim(launched.output);
+
+let mutable served: Int = 0;
+while !file_exists(report_path) && served < 200 {
+    let ok: Bool = http_serve_one(listener, handler, 4194304);
+    served += 1;
+}
+let closed: Bool = net_close(listener);
+let killed: Capture = os_capture_status("kill " + chrome_pid + " 2>/dev/null");
+
+let mutable mounted: Bool = false;
+let mutable html: String = "";
+let mutable modes: [String] = [];
+let mutable why: String = "the page never reported — it did not reach either branch of its own"
+    + " try/catch, and nothing was written to the report";
+
+if file_exists(report_path) {
+    let body: String = file_read(report_path);
+    match json_parse(body) {
+        Ok(value) => {
+            mounted = truth_of(field_of(value, "mounted"));
+            html = text_of(field_of(value, "html"));
+            let n: Int = names_in(field_of(value, "modes"), modes);
+            let stated: String = text_of(field_of(value, "error"));
+            if len(stated) > 0 {
+                why = stated;
+            }
+        }
+        Error(bad) => {
+            why = "unreadable report: " + substring(body, 0, 200);
+        }
+    }
+}
+
+let mutable dom: String = html;
+if mounted {
+    dom = dom + " data-comet-ready=\"yes\"";
+}
+if show {
+    print("--- reported html ---");
+    let mutable cut: Int = 900;
+    if len(dom) < cut { cut = len(dom); }
+    print(substring(dom, 0, cut));
+    print("---");
+}
+if prove {
+    dom = "";
+    let mutable only: [String] = [];
+    let b: Int = push(only, "bmx");
+    modes = only;
+}
+
+let mutable tally: Tally = Tally { ran: 0, broken: 0 };
+
+// ---- the accepting case, first and fatally --------------------------------------------------------
+//
+// A page that fails to mount fails every assertion below for the same reason, and a suite of those
+// reads as many defects rather than one. So this is the gate: nothing under it means anything.
+//
+// **The page's own error, not a search of the DOM for one.** The JavaScript's first version looked for
+// `MOUNT FAILED:` in the markup and printed "(no reason in the DOM)" when the page had reported a full
+// stack trace — a harness withholding the answer it was handed.
+let x1: Int = check(tally, contains(dom, "data-comet-ready=\"yes\""),
+    "the playground mounts in Chrome",
+    "the page did not mount — everything below is the same defect: " + why);
+
+// BMX rendered, by the format's own implementation, with the values pane as its bindings.
+let x2: Int = check(tally, contains(dom, "A-1042") && contains(dom, "data-comet-rendered"),
+    "BMX rendered a page from the document and the values beside it",
+    "the result pane holds no rendered page — the default document did not render");
+
+// Every adapter that registered is a mode the reader can reach.
+let x3: Int = check(tally,
+    has(modes, "bmx") && has(modes, "sbmx") && has(modes, "burxt"),
+    "three languages registered through the public API (" + string_join(modes, ", ") + ")",
+    "the registry holds " + string_join(modes, ", ") + " — an adapter failed to register, and a missing"
+        + " tab is indistinguishable from a broken one");
+
+print("");
+if prove {
+    if tally.broken > 0 {
+        print("the control failed as it must — a page that does not mount, and an output pane with no"
+            + " component in it, are both caught");
+        exit(0);
+    }
+    print("THE CONTROL DID NOT FAIL, so this check cannot see the defects it exists for");
+    exit(1);
+}
+if tally.broken > 0 {
+    print(to_string(tally.broken) + " of " + to_string(tally.ran) + " things wrong in the browser");
+    exit(1);
+}
+if tally.ran != 3 {
+    print("only " + to_string(tally.ran) + " of 3 checks ran");
+    exit(1);
+}
+print("the playground mounts and star answers, in a real browser, over "
+    + to_string(served) + " request(s)");

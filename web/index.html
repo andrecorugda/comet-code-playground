@@ -71,11 +71,27 @@
       bindings: '{\n  "reference": "A-1042",\n  "name": "Ada",\n  "total": "£49.00"\n}',
     });
 
-    // `mount` seeds the editor and runs once, so there is nothing for this page to drive.
-    await new Promise((r) => setTimeout(r, 600));
+    // **A fixed sleep is not a condition, and this one was a race.** `mount` seeds the editor and runs
+    // once, but the first render lands asynchronously — so 600ms was a guess that the DOM had caught up.
+    // It usually had. Under repeated runs it lost once in five: the report went out before
+    // `data-comet-rendered` existed, and the harness reported "the default document did not render"
+    // about a page that rendered it a moment later. **A check that usually passes is worse than one that
+    // fails**, because it teaches everyone to re-run instead of to look.
+    //
+    // Found by porting the harness to Burxt and therefore running it five times in a row. One harness
+    // run proves nothing about a race; the flake is in this page and both harnesses inherited it.
+    //
+    // So this waits for the condition. The deadline stays, but only as a floor for REPORTING: if the
+    // render never lands, the report still goes out and still says so, rather than hanging and letting
+    // an outer `timeout` decide what happened.
+    let landed = false;
+    for (let i = 0; i < 120 && !landed; i += 1) {
+      landed = !!document.querySelector('[data-comet-rendered]');
+      if (!landed) await new Promise((r) => setTimeout(r, 25));
+    }
 
     document.body.dataset.cometReady = 'yes';
-    report({ mounted: true, modes: comet.registered().map((m) => m.id),
+    report({ mounted: true, rendered: landed, modes: comet.registered().map((m) => m.id),
              html: document.querySelector('#root').innerHTML });
   } catch (e) {
     document.querySelector('#root').textContent = 'MOUNT FAILED: ' + e.message;

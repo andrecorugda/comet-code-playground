@@ -1,3 +1,7 @@
+// not-burxt: platform — the wasm host contract: seven imports, and Burxt Strings marshalled across
+//            the boundary as a length prefix plus bytes. Nothing here decides anything — every answer
+//            the playground gives is computed in `comet-engine.wasm`, which is star's generator and
+//            BMX's renderer compiled from Burxt. This is the seven functions that module imports
 // The one place JavaScript is unavoidable: handing a WebAssembly module its imports.
 //
 // **Nothing here decides anything.** Every answer the playground gives is computed in Burxt, inside

@@ -1,3 +1,6 @@
+// not-burxt: platform — fourteen lines registering BMX with the browser-side registry. Every decision
+//            is BMX's own Burxt implementation in `comet-engine.wasm`; this hands it a string and reads
+//            one back. It was 1,171 lines of vendored `bmx.js` until that module existed
 // BMX. Every decision is BMX's own Burxt implementation, in `comet-engine.wasm`.
 import comet from '../comet.js';
 import { engine } from '../engine.js';

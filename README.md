@@ -111,8 +111,9 @@ LLD=$(ls "$HOME"/.rustup/toolchains/*/lib/rustlib/*/bin/rust-lld | head -1)
   -z stack-size=1048576 --initial-memory=4194304 --max-memory=268435456 \
   build/entry.o -o web/comet-engine.wasm
 
+burxt build tests/browser.bx -o comet-browser     # the browser harness
 ./comet-serve web 8000                            # then open http://localhost:8000
-node tests/browser.mjs                            # checks it in a real browser
+timeout 90 ./comet-browser                        # checks it in a real browser
 ```
 
 **Four things in that block used to be wrong, and each one only a reader would have found.**

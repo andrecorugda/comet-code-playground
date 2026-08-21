@@ -1,3 +1,5 @@
+// not-burxt: platform — registers Burxt with the browser-side registry, and calls `bx.play` in the
+//            wasm. The compiler is not in the browser, so this runs what the engine can and says so
 // Burxt, and an honest account of why it checks nothing yet.
 //
 // Registered rather than omitted, because a missing tab is indistinguishable from a broken one and an

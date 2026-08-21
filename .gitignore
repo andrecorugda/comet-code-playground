@@ -5,8 +5,10 @@
 # and a page that needs a build step to be viewable is a page nobody views.
 build/
 
-# The local server, compiled from `serve.bx`. Built, not committed — like every tool in the family.
+# The local server and the browser harness, compiled from `serve.bx` and `tests/browser.bx`. Built, not
+# committed — like every tool in the family.
 comet-serve
+comet-browser
 
 # `star-check` writes one of these beside every document it checks.
 *.check.bx

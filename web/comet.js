@@ -1,3 +1,6 @@
+// not-burxt: platform — the registry an embedder calls: `comet.register({id, label, run})` and
+//            `comet.mount(...)`. It is the public API of a browser library, so it is reached by a
+//            `<script type="module">` on somebody else's page. A Burxt module cannot be imported by one
 // comet — an embeddable, client-only code playground with a language registry.
 //
 // **This file knows nothing about any language.** It owns an editor, a result pane, a scope pane, and
