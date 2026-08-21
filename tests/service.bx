@@ -1,0 +1,181 @@
+// The environment and run core: does a declaration become a sandbox, and is the sandbox sealed?
+//
+//     burxt build tests/service.bx -o comet-service-test
+//     ./comet-service-test
+//
+// **The negative cases here are the product's security story, so they are not optional.** A playground
+// runs a stranger's code on our account: if the deadline, the network policy or the isolation between
+// runs stops holding, everything else about comet stops mattering. Each one is a plant aimed at exactly
+// one guarantee, because a plant that trips a different check has not tested the one you wrote.
+//
+// This runs against whichever backend `sandbox.bx` chooses. On this machine that is Docker, because
+// nothing here can authenticate to Vercel — and a suite that only runs where a cloud credential exists
+// is a suite nobody runs.
+use "std/files.bx";
+use "std/string.bx";
+use "std/os.bx";
+use "../service/sandbox.bx";
+
+class Tally { ran: Int, broken: Int }
+
+function check(mutable tally: Tally, ok: Bool, name: String, detail: String) -> Int {
+    tally.ran += 1;
+    if ok {
+        print("  ok    " + name);
+        return 0;
+    }
+    tally.broken += 1;
+    print("  FAIL  " + name);
+    print("        " + detail);
+    return 1;
+}
+
+pure function contains(haystack: String, needle: String) -> Bool {
+    return string_find(haystack, needle) >= 0;
+}
+
+pure function first_line(text: String) -> String allocates {
+    let rows: [String] = string_lines(string_trim(text));
+    if len(rows) == 0 {
+        return "";
+    }
+    return rows[0];
+}
+
+let mutable tally: Tally = Tally { ran: 0, broken: 0 };
+
+let which: String = backend();
+if len(which) == 0 {
+    print_error("no sandbox backend on this machine: make docker usable, or set VERCEL_AUTH_TOKEN");
+    exit(2);
+}
+print("backend: " + which);
+
+let mutable scratch: String = "";
+match file_temp_directory("comet-tests") {
+    None => {
+        print_error("cannot make a temporary directory");
+        exit(2);
+    }
+    Some(dir) => { scratch = dir; }
+}
+
+// ---- the declaration, and the digest that makes staleness impossible ----------------------------
+
+let d: Declaration = read_declaration("environments/burxt.json");
+let x1: Int = check(tally, d.ok && len(d.digest) == 12,
+    "environments/burxt.json reads, and hashes to " + d.digest,
+    "the declaration did not read: " + d.why);
+
+// **A declaration that would build a DIFFERENT image must not be served from the old one — and one that
+// would build the same image must not force a rebuild.** Both directions, because either failure is
+// expensive: the first serves stale software, the second rebuilds for nothing and suggests the
+// environment changed when it did not.
+let original: String = file_read("environments/burxt.json");
+let quick_path: String = scratch + "/quick.json";
+let extra_path: String = scratch + "/extra.json";
+// A run-time field only: a different deadline, the same installed software.
+let w1: Int = file_write(quick_path, string_replace(original, "\"timeout_ms\": 10000", "\"timeout_ms\": 2000"));
+// An install step: different software.
+let w2: Int = file_write(extra_path, string_replace(original, "\"bootstrap\": []",
+    "\"bootstrap\": [\"echo baked > /work/marker\"]"));
+let quick: Declaration = read_declaration(quick_path);
+let extra: Declaration = read_declaration(extra_path);
+let x2: Int = check(tally, quick.digest == d.digest && extra.digest != d.digest,
+    "the digest follows what BUILDS the image, not the whole file",
+    "a changed timeout gave " + quick.digest + " (should equal " + d.digest
+        + ") and a changed bootstrap gave " + extra.digest + " (should differ)");
+
+// ---- provisioning ------------------------------------------------------------------------------
+
+print("  ..    provisioning " + d.label + " (a first build takes a few minutes)");
+let first: Provisioned = provision(d, scratch);
+let x3: Int = check(tally, first.ok && len(first.reference) > 0,
+    "the declaration provisions to " + first.reference,
+    "provisioning failed: " + first.why);
+if !first.ok {
+    print("");
+    print("nothing below can mean anything without an environment, so this stops here.");
+    exit(1);
+}
+
+// Twice, because a second provision of an unchanged declaration must cost nothing.
+let again: Provisioned = provision(d, scratch);
+let x4: Int = check(tally, again.ok && again.reference == first.reference,
+    "provisioning again reuses it rather than rebuilding",
+    "the second provision gave " + again.reference + " where the first gave " + first.reference);
+
+// ---- a run --------------------------------------------------------------------------------------
+
+let hello: Outcome = run_source(d, first.reference, "print(\"hello from a sandbox\");\n");
+let x5: Int = check(tally,
+    hello.exit == 0 && contains(hello.stdout, "hello from a sandbox") && !hello.timed_out,
+    "a program runs and its stdout comes back (" + to_string(hello.ms) + "ms)",
+    "exit=" + to_string(hello.exit) + " stdout=" + first_line(hello.stdout)
+        + " stderr=" + first_line(hello.stderr) + " " + hello.why);
+
+// **A program's own failure is not the harness failing.** Reporting exit 3 as "something went wrong"
+// would hide the one thing the visitor needs to see.
+let refused: Outcome = run_source(d, first.reference,
+    "print(\"before\");\nexit(3);\n");
+let x6: Int = check(tally, refused.exit == 3 && contains(refused.stdout, "before"),
+    "a program that exits 3 is reported as exit 3, with what it printed first",
+    "exit=" + to_string(refused.exit) + " stdout=" + first_line(refused.stdout));
+
+// stderr has to arrive separately, or a diagnostic and an answer become the same string.
+let noisy: Outcome = run_source(d, first.reference,
+    "print(\"on stdout\");\nprint_error(\"on stderr\");\n");
+let x7: Int = check(tally,
+    contains(noisy.stdout, "on stdout") && contains(noisy.stderr, "on stderr")
+        && !contains(noisy.stdout, "on stderr"),
+    "stdout and stderr arrive as two streams, not one",
+    "stdout=" + first_line(noisy.stdout) + " stderr=" + first_line(noisy.stderr));
+
+// ---- the guarantees a stranger's code is held to ------------------------------------------------
+//
+// Everything above is about the core working. These four are about it being safe, and each is a plant
+// aimed at exactly one of them.
+
+// **The deadline.** A program that never ends must be killed, reported as killed rather than as a
+// failure of its own, and must not hold the suite open while it happens. `quick` is the same image with
+// a two-second budget, which is why the digest narrowing above mattered — this needs no rebuild.
+let quick_ready: Provisioned = provision(quick, scratch);
+let looping: Outcome = run_source(quick, quick_ready.reference,
+    "let mutable i: Int = 0;\nwhile true \{ i += 1; \}\n");
+let x8: Int = check(tally, looping.timed_out && looping.ms < 30000,
+    "a program that never ends is killed at its deadline (" + to_string(looping.ms) + "ms)",
+    "timed_out=" + to_string(looping.timed_out) + " ms=" + to_string(looping.ms)
+        + " exit=" + to_string(looping.exit) + " " + looping.why);
+
+// **The network policy.** A run reaching the internet is the failure that turns our account into
+// somebody else's proxy, so the assertion is that it CANNOT — and that the reason it failed is the
+// network rather than a missing module or a typo in the probe.
+let reaching: Outcome = run_source(d, first.reference,
+    "use \"std/http.bx\";\nmatch http_get(1,1,1,1,80,\"one.one.one.one\",\"/\") \{\n"
+    + "  Ok(r) => \{ print(\"REACHED status \" + to_string(r.status)); \}\n"
+    + "  Error(w) => \{ print(\"refused: \" + w); \}\n\}\n");
+let x9: Int = check(tally,
+    contains(reaching.stdout, "refused:") && !contains(reaching.stdout, "REACHED"),
+    "a run cannot reach the internet, and fails for that reason",
+    "stdout=" + first_line(reaching.stdout) + " stderr=" + first_line(reaching.stderr));
+
+// **Isolation between runs.** One visitor writing a file must leave nothing for the next, and the check
+// is ordered: write, then look, in two separate runs.
+let leaving: Outcome = run_source(d, first.reference,
+    "use \"std/files.bx\";\nlet n: Int = file_write(\"/work/left-behind\", \"from an earlier run\");\n"
+    + "print(\"wrote \" + to_string(n));\n");
+let looking: Outcome = run_source(d, first.reference,
+    "use \"std/files.bx\";\nif file_exists(\"/work/left-behind\") \{\n"
+    + "  print(\"LEAKED: \" + file_read(\"/work/left-behind\"));\n\} else \{ print(\"clean\"); \}\n");
+let x10: Int = check(tally,
+    contains(leaving.stdout, "wrote") && contains(looking.stdout, "clean")
+        && !contains(looking.stdout, "LEAKED"),
+    "a run cannot see what an earlier run left behind",
+    "the writing run said " + first_line(leaving.stdout) + " and the looking run said "
+        + first_line(looking.stdout));
+
+print("");
+print(to_string(tally.ran) + " checked, " + to_string(tally.broken) + " broken");
+if tally.broken > 0 {
+    exit(1);
+}

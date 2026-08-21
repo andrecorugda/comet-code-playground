@@ -1,0 +1,15 @@
+{
+  "id": "burxt",
+  "label": "Burxt",
+  "image": "ubuntu:24.04",
+  "install": [
+    "apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gcc libc6-dev && rm -rf /var/lib/apt/lists/*",
+    "curl -fsSL https://github.com/andrecorugda/burxt/releases/download/v1.7.0/burxt-1.7.0-linux-x86_64.tar.gz -o /tmp/b.tgz",
+    "mkdir -p /tmp/b /usr/local/lib/burxt && tar xzf /tmp/b.tgz -C /tmp/b --strip-components=1 && install -m 755 /tmp/b/burxt /usr/local/bin/burxt && install -m 644 /tmp/b/lib/*.bx /usr/local/lib/burxt/ && rm -rf /tmp/b /tmp/b.tgz"
+  ],
+  "bootstrap": [],
+  "file": "main.bx",
+  "run": ["burxt", "run", "/work/main.bx"],
+  "timeout_ms": 10000,
+  "vcpus": 1
+}

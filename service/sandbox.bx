@@ -1,0 +1,581 @@
+// The one place comet reaches a sandbox provider.
+//
+// **Two backends, one seam, and the reason is not portability — it is that the checks have to run.**
+// Production is Vercel Sandbox: a Firecracker microVM per run, its own kernel, built for untrusted code.
+// Development and CI are Docker, because nothing here can authenticate to Vercel without Andre's token,
+// and a suite that only runs where a cloud credential exists is a suite nobody runs.
+//
+// Every other file goes through `provision` and `run_source`. Neither mentions a provider.
+//
+// ---- why the CLI rather than the API, which is measured rather than preferred -------------------
+//
+// Vercel has a REST API and a JS/Python SDK. **Burxt cannot reach any of them**: `http_get` takes four
+// address octets because `getaddrinfo` returns but its chain cannot be walked from a Burxt program —
+// recorded in Burxt's own `docs/limitations.md` — and a CDN-fronted address is not something to
+// hard-code. So the `vercel` CLI is driven as a binary through `os_capture_status`, exactly as star's
+// `tools/gallery.bx` drives Chrome and `tests/extension.bx` drives the packer.
+//
+// The CLI surface was read from `vercel sandbox <sub> --help` at CLI 55.0.0 rather than assumed:
+//
+//     create  --name --image --snapshot --network-policy --timeout --vcpus --non-persistent --silent
+//     exec    <name> --sudo -w -- <argv>
+//     copy    <local> <name>:<path>
+//     snapshot <name> --stop --silent        -> prints the snapshot id
+//     remove  <name>
+//
+// `--token` or `VERCEL_AUTH_TOKEN` authenticates without an interactive login, which is what makes this
+// usable from a service at all.
+use "std/files.bx";
+use "std/string.bx";
+use "std/json.bx";
+use "std/hash.bx";
+use "std/os.bx";
+
+// ---- a declaration ------------------------------------------------------------------------------
+//
+// What a playground owner fills in. As much as their language needs; the rest stays empty.
+class Declaration {
+    id: String,
+    label: String,
+    image: String,
+    install: [String],
+    bootstrap: [String],
+    file: String,
+    argv: [String],
+    timeout_ms: Int,
+    vcpus: Int,
+    // sha256 of the fields that DECIDE THE IMAGE — image, install, bootstrap — and nothing else.
+    //
+    // **The first version hashed the whole declaration and writing the deadline test found it wrong.**
+    // `timeout_ms`, `vcpus`, `file` and `run` are run-time parameters: changing a timeout from 10s to 2s
+    // would have moved the digest and forced a rebuild of a byte-identical image. Worse, it would have
+    // suggested the environment had changed when nothing installed in it had.
+    //
+    // The property that matters is unchanged and is the one worth stating: **a declaration that would
+    // build a different image cannot be served from the old one.** Editing an install step moves the
+    // digest; editing a timeout does not, because it does not touch what is installed.
+    digest: String,
+    ok: Bool,
+    why: String,
+}
+
+class Provisioned { ok: Bool, reference: String, digest: String, why: String }
+
+// What a run produced. `timed_out` is separate from a non-zero exit because "your program was killed at
+// ten seconds" and "your program returned 3" are different answers and a reader deserves the right one.
+class Outcome {
+    ok: Bool,
+    stdout: String,
+    stderr: String,
+    exit: Int,
+    ms: Int,
+    timed_out: Bool,
+    why: String,
+}
+
+pure function field_of(value: Json, name: String) -> Json {
+    match value {
+        Object(fields) => {
+            let mutable i: Int = 0;
+            while i < len(fields) {
+                if fields[i].name == name {
+                    return fields[i].value;
+                }
+                i += 1;
+            }
+            return Json.Null;
+        }
+        Null => { return Json.Null; }
+        Truth(b) => { return Json.Null; }
+        Number(n) => { return Json.Null; }
+        Text(s) => { return Json.Null; }
+        List(items) => { return Json.Null; }
+    }
+}
+
+pure function text_of(value: Json) -> String {
+    match value {
+        Text(s) => { return s; }
+        Number(n) => { return n; }
+        Null => { return ""; }
+        Truth(b) => { return ""; }
+        List(items) => { return ""; }
+        Object(f) => { return ""; }
+    }
+}
+
+pure function int_of(value: Json, fallback: Int) -> Int {
+    match value {
+        Number(digits) => { return string_to_int(digits, fallback); }
+        Text(s) => { return string_to_int(s, fallback); }
+        Null => { return fallback; }
+        Truth(b) => { return fallback; }
+        List(items) => { return fallback; }
+        Object(f) => { return fallback; }
+    }
+}
+
+function strings_of(value: Json, mutable into: [String]) -> Int {
+    match value {
+        List(items) => {
+            let mutable i: Int = 0;
+            while i < len(items) {
+                let x: Int = push(into, text_of(items[i]));
+                i += 1;
+            }
+            return len(items);
+        }
+        Null => { return 0; }
+        Truth(b) => { return 0; }
+        Number(n) => { return 0; }
+        Text(s) => { return 0; }
+        Object(f) => { return 0; }
+    }
+}
+
+// One shell word, quoted so a space or a quote in a declaration cannot become an argument.
+pure function quoted(word: String) -> String allocates {
+    let mutable out: String = "'";
+    let mutable i: Int = 0;
+    while i < len(word) {
+        let c: String = substring(word, i, 1);
+        if c == "'" {
+            // End the quote, escape one apostrophe, reopen. The only way to put `'` inside `'...'`.
+            out = out + "'\\''";
+        } else {
+            out = out + c;
+        }
+        i += 1;
+    }
+    return out + "'";
+}
+
+pure function joined(words: [String]) -> String allocates {
+    let mutable out: String = "";
+    let mutable i: Int = 0;
+    while i < len(words) {
+        if i > 0 {
+            out = out + " ";
+        }
+        out = out + quoted(words[i]);
+        i += 1;
+    }
+    return out;
+}
+
+function read_declaration(path: String) -> Declaration allocates touches files, commands {
+    let mutable empty: [String] = [];
+    let mutable no_argv: [String] = [];
+    if !file_exists(path) {
+        return Declaration { id: "", label: "", image: "", install: empty, bootstrap: empty,
+            file: "", argv: no_argv, timeout_ms: 0, vcpus: 0, digest: "", ok: false,
+            why: "no declaration at " + path };
+    }
+    let text: String = file_read(path);
+    let mutable value: Json = Json.Null;
+    match json_parse(text) {
+        Ok(parsed) => { value = parsed; }
+        Error(bad) => {
+            return Declaration { id: "", label: "", image: "", install: empty, bootstrap: empty,
+                file: "", argv: no_argv, timeout_ms: 0, vcpus: 0, digest: "", ok: false,
+                why: path + " does not parse: " + bad };
+        }
+    }
+
+    let mutable install: [String] = [];
+    let i1: Int = strings_of(field_of(value, "install"), install);
+    let mutable bootstrap: [String] = [];
+    let b1: Int = strings_of(field_of(value, "bootstrap"), bootstrap);
+    let mutable argv: [String] = [];
+    let a1: Int = strings_of(field_of(value, "run"), argv);
+
+    let id: String = text_of(field_of(value, "id"));
+    let file: String = text_of(field_of(value, "file"));
+    let mutable why: String = "";
+    if len(id) == 0 {
+        why = path + " declares no `id`";
+    }
+    if len(file) == 0 && len(why) == 0 {
+        why = path + " declares no `file`, so there is nowhere to put a visitor's source";
+    }
+    if len(argv) == 0 && len(why) == 0 {
+        why = path + " declares no `run`, so nothing would happen";
+    }
+
+    let mutable label: String = text_of(field_of(value, "label"));
+    if len(label) == 0 {
+        label = id;
+    }
+    let mutable image: String = text_of(field_of(value, "image"));
+    if len(image) == 0 {
+        image = "ubuntu:24.04";
+    }
+
+    return Declaration {
+        id: id, label: label, image: image,
+        install: install, bootstrap: bootstrap,
+        file: file, argv: argv,
+        timeout_ms: int_of(field_of(value, "timeout_ms"), 10000),
+        vcpus: int_of(field_of(value, "vcpus"), 1),
+        // Only what the image is built from. `image` cannot contain a newline and the steps are joined
+        // with one, so two different declarations cannot collide by rearranging their boundaries.
+        digest: substring(hash_hex(sha256_text(
+            image + "\n" + string_join(install, "\n") + "\n--\n" + string_join(bootstrap, "\n"))), 0, 12),
+        ok: len(why) == 0,
+        why: why,
+    };
+}
+
+// ---- which backend ------------------------------------------------------------------------------
+//
+// **Named rather than guessed, and it refuses rather than defaulting.** A service that silently fell
+// back to a weaker sandbox because a token was missing would be the worst possible failure: it would
+// work, and the isolation would be gone.
+function backend() -> String allocates touches commands, files, input {
+    let forced: String = os_env_or("COMET_BACKEND", "");
+    if len(forced) > 0 {
+        return forced;
+    }
+    let token: String = os_env_or("VERCEL_AUTH_TOKEN", "");
+    if len(token) > 0 {
+        let cli: Capture = os_capture_status("command -v vercel 2>/dev/null");
+        if cli.code == 0 && len(string_trim(cli.output)) > 0 {
+            return "vercel";
+        }
+    }
+    let docker: Capture = os_capture_status("docker info >/dev/null 2>&1");
+    if docker.code == 0 {
+        return "docker";
+    }
+    return "";
+}
+
+// ---- running a command, timed, with the program's own streams kept clean -------------------------
+//
+// **Burxt has no sub-second clock.** `os_now()` answers whole seconds and `time.bx` records why: no
+// milliseconds and no monotonic clock, because both need `clock_gettime`. A console that says
+// "finished in 240ms" needs better than that, so the elapsed time is measured by the shell — and this
+// is a named gap for the language session with that console as its concrete caller.
+//
+// The shape matters for a reason beyond timing: **the program's stdout and stderr go to files, and only
+// the exit code and the elapsed milliseconds come back on stdout.** If they shared a stream, a program
+// that printed `0 5` would be indistinguishable from a harness reporting success — and a visitor's
+// program is exactly the thing that would.
+class Timed { exit: Int, ms: Int, stdout: String, stderr: String }
+
+function timed(command: String, scratch: String) -> Timed allocates touches commands, files, input {
+    let out_path: String = scratch + "/stdout";
+    let err_path: String = scratch + "/stderr";
+    let ran: Capture = os_capture_status(
+        "s=$(date +%s%3N); " + command
+        + " >" + quoted(out_path) + " 2>" + quoted(err_path) + "; rc=$?;"
+        + " e=$(date +%s%3N); printf '%s %s\\n' \"$rc\" \"$((e-s))\"");
+    let mutable exit_code: Int = 0 - 1;
+    let mutable ms: Int = 0;
+    let parts: [String] = string_split(string_trim(ran.output), " ");
+    if len(parts) >= 2 {
+        exit_code = string_to_int(parts[0], 0 - 1);
+        ms = string_to_int(parts[1], 0);
+    }
+    let mutable stdout_text: String = "";
+    let mutable stderr_text: String = "";
+    if file_exists(out_path) {
+        stdout_text = file_read(out_path);
+    }
+    if file_exists(err_path) {
+        stderr_text = file_read(err_path);
+    }
+    return Timed { exit: exit_code, ms: ms, stdout: stdout_text, stderr: stderr_text };
+}
+
+// Whole seconds, rounded UP, because `timeout` takes seconds and rounding a 1,500ms budget down to one
+// second would kill a program the declaration said could take longer.
+pure function seconds_for(timeout_ms: Int) -> Int {
+    let s: Int = divide_floor(timeout_ms + 999, 1000);
+    if s < 1 {
+        return 1;
+    }
+    return s;
+}
+
+// ---- provisioning -------------------------------------------------------------------------------
+
+// A Dockerfile from a declaration. Only the local backend uses this; Vercel takes the same steps as
+// `exec` calls against a live sandbox, which is why the declaration describes STEPS rather than a file.
+pure function dockerfile_for(d: Declaration) -> String allocates {
+    let mutable out: String = "FROM " + d.image + "\n";
+    let mutable i: Int = 0;
+    while i < len(d.install) {
+        out = out + "RUN " + d.install[i] + "\n";
+        i += 1;
+    }
+    out = out + "WORKDIR /work\n";
+    let mutable b: Int = 0;
+    while b < len(d.bootstrap) {
+        // **Bootstrap runs with the network on, at build time.** This is what makes star's playground
+        // possible: `burxt fetch` happens once here and is baked in, rather than every visitor waiting
+        // for a download they could not make anyway once the run is sealed off.
+        out = out + "RUN " + d.bootstrap[b] + "\n";
+        b += 1;
+    }
+    return out;
+}
+
+function provision_docker(d: Declaration, scratch: String) -> Provisioned
+        allocates touches commands, files, input {
+    let tag: String = "comet-env:" + d.id + "-" + d.digest;
+    // Already built for this exact declaration? Then there is nothing to do, and the digest is what
+    // makes that safe to say.
+    let known: Capture = os_capture_status(
+        "docker image inspect " + quoted(tag) + " >/dev/null 2>&1");
+    if known.code == 0 {
+        return Provisioned { ok: true, reference: tag, digest: d.digest,
+            why: "already built for this declaration" };
+    }
+    let path: String = scratch + "/Dockerfile";
+    let wrote: Int = file_write(path, dockerfile_for(d));
+    if wrote < 0 {
+        return Provisioned { ok: false, reference: "", digest: d.digest,
+            why: "cannot write a Dockerfile to " + path };
+    }
+    let built: Capture = os_capture_status("docker build -q -t " + quoted(tag)
+        + " -f " + quoted(path) + " " + quoted(scratch) + " 2>&1");
+    if built.code != 0 {
+        return Provisioned { ok: false, reference: "", digest: d.digest,
+            why: "docker build failed: " + string_trim(built.output + built.errors) };
+    }
+    return Provisioned { ok: true, reference: tag, digest: d.digest, why: "" };
+}
+
+function provision_vercel(d: Declaration, scratch: String) -> Provisioned
+        allocates touches commands, files, input {
+    let name: String = "comet-env-" + d.id + "-" + d.digest;
+    // **The network is ON here and off at run time.** Provisioning is the only moment anything is
+    // allowed to fetch, which is why the two phases exist at all.
+    let made: Capture = os_capture_status("vercel sandbox create --name " + quoted(name)
+        + " --image " + quoted(d.image)
+        + " --network-policy allow-all --timeout 15m --silent 2>&1");
+    if made.code != 0 {
+        return Provisioned { ok: false, reference: "", digest: d.digest,
+            why: "vercel sandbox create failed: " + string_trim(made.output + made.errors) };
+    }
+    let mutable steps: [String] = [];
+    let mutable i: Int = 0;
+    while i < len(d.install) {
+        let x: Int = push(steps, d.install[i]);
+        i += 1;
+    }
+    let mutable b: Int = 0;
+    while b < len(d.bootstrap) {
+        let x: Int = push(steps, "cd /work && " + d.bootstrap[b]);
+        b += 1;
+    }
+    let mutable s: Int = 0;
+    while s < len(steps) {
+        let step: Capture = os_capture_status("vercel sandbox exec --sudo " + quoted(name)
+            + " -- sh -c " + quoted(steps[s]) + " 2>&1");
+        if step.code != 0 {
+            let gone: Capture = os_capture_status("vercel sandbox remove " + quoted(name) + " 2>&1");
+            return Provisioned { ok: false, reference: "", digest: d.digest,
+                why: "provisioning step failed: " + steps[s] + " -> "
+                    + string_trim(step.output + step.errors) };
+        }
+        s += 1;
+    }
+    // `--silent` suppresses the id, so this is the one call whose stdout IS the answer.
+    let snap: Capture = os_capture_status("vercel sandbox snapshot " + quoted(name) + " --stop 2>&1");
+    let reference: String = string_trim(snap.output);
+    if snap.code != 0 || len(reference) == 0 {
+        return Provisioned { ok: false, reference: "", digest: d.digest,
+            why: "snapshot failed: " + string_trim(snap.output + snap.errors) };
+    }
+    return Provisioned { ok: true, reference: reference, digest: d.digest, why: "" };
+}
+
+function provision(d: Declaration, scratch: String) -> Provisioned
+        allocates touches commands, files, input {
+    if !d.ok {
+        return Provisioned { ok: false, reference: "", digest: d.digest, why: d.why };
+    }
+    let which: String = backend();
+    if which == "docker" {
+        return provision_docker(d, scratch);
+    }
+    if which == "vercel" {
+        return provision_vercel(d, scratch);
+    }
+    return Provisioned { ok: false, reference: "", digest: d.digest,
+        why: "no sandbox backend: set VERCEL_AUTH_TOKEN with the vercel CLI on PATH, or make docker"
+            + " usable. **This refuses rather than falling back**, because a service that quietly ran"
+            + " a visitor's code with weaker isolation would still work, and that is the failure you"
+            + " would never notice" };
+}
+
+// ---- a run --------------------------------------------------------------------------------------
+//
+// **Locked down by decision, not by inheritance.** A visitor on somebody else's embedded page is a
+// stranger driving our account, so a run gets no network, a wall clock it cannot extend, capped CPU and
+// memory, and a filesystem nothing else will ever see. The cost — nothing can fetch a package at run
+// time — is exactly what `bootstrap` absorbed at provision.
+//
+// `timeout` sits OUTSIDE whatever the backend does, because a sandbox that ignores its own limit still
+// has to die. Exit 124 is `timeout`'s way of saying it did the killing, which is why that code is read
+// as a deadline rather than as the program's answer.
+function run_docker(d: Declaration, reference: String, work: String, scratch: String) -> Outcome
+        allocates touches commands, files, input {
+    let seconds: Int = seconds_for(d.timeout_ms);
+    let memory: Int = d.vcpus * 2048;
+    let slash: Int = string_rfind(scratch, "/");
+    let name: String = "comet-run-" + substring(scratch, slash + 1, len(scratch) - slash - 1);
+    let out_path: String = scratch + "/stdout";
+    let err_path: String = scratch + "/stderr";
+
+    // **`timeout docker run` does not stop the container, and finding that out cost eleven minutes of
+    // somebody's CPU.** The first version wrapped an attached `docker run` in `timeout`. A program that
+    // never ends made `timeout` kill the docker CLIENT — and the container carried on looping, `--rm`
+    // never fired, and it was still burning a core when I went looking for the hang. **A visitor could
+    // have left one running forever.** The signal reached the wrong process, which is a class of mistake
+    // no amount of tightening the flags would have caught.
+    //
+    // So the container is detached and named, the WAIT is what gets a deadline, and the kill is
+    // unconditional — it runs whether the wait timed out or not, because a kill on an exited container
+    // is free and a missed kill is not.
+    //
+    // `docker logs` is what separates the streams afterwards, and `docker inspect` is what gives the
+    // program's real exit code rather than the CLI's. Every literal brace in that format string is
+    // `\{`, because an unescaped one is an interpolation to this compiler.
+    let script: String =
+        "s=$(date +%s%3N); "
+        + "docker run -d --name " + quoted(name) + " --network=none --read-only"
+        + " --tmpfs /tmp:rw,exec,size=64m"
+        + " --memory " + to_string(memory) + "m --cpus " + to_string(d.vcpus)
+        + " --pids-limit 128 --cap-drop ALL --security-opt no-new-privileges"
+        + " -v " + quoted(work) + ":/work -w /work "
+        + quoted(reference) + " " + joined(d.argv) + " >/dev/null 2>&1; "
+        + "to=0; timeout " + to_string(seconds) + "s docker wait " + quoted(name)
+        + " >/dev/null 2>&1 || to=1; "
+        + "docker kill " + quoted(name) + " >/dev/null 2>&1; "
+        + "docker logs " + quoted(name) + " >" + quoted(out_path) + " 2>" + quoted(err_path) + "; "
+        + "rc=$(docker inspect -f '\{\{.State.ExitCode\}\}' " + quoted(name)
+        + " 2>/dev/null || echo -1); "
+        + "docker rm -f " + quoted(name) + " >/dev/null 2>&1; "
+        + "e=$(date +%s%3N); printf '%s %s %s\\n' \"$to\" \"$rc\" \"$((e-s))\"";
+
+    let ran: Capture = os_capture_status(script);
+    let parts: [String] = string_split(string_trim(ran.output), " ");
+    let mutable killed: Bool = false;
+    let mutable exit_code: Int = 0 - 1;
+    let mutable ms: Int = 0;
+    if len(parts) >= 3 {
+        killed = parts[0] == "1";
+        exit_code = string_to_int(parts[1], 0 - 1);
+        ms = string_to_int(parts[2], 0);
+    }
+    let mutable stdout_text: String = "";
+    let mutable stderr_text: String = "";
+    if file_exists(out_path) {
+        stdout_text = file_read(out_path);
+    }
+    if file_exists(err_path) {
+        stderr_text = file_read(err_path);
+    }
+    let mutable why: String = "";
+    if killed {
+        why = "killed at the " + to_string(seconds) + "s deadline";
+    }
+    return Outcome { ok: !killed, stdout: stdout_text, stderr: stderr_text,
+        exit: exit_code, ms: ms, timed_out: killed, why: why };
+}
+
+function run_vercel(d: Declaration, reference: String, work: String, scratch: String) -> Outcome
+        allocates touches commands, files, input {
+    let seconds: Int = seconds_for(d.timeout_ms);
+    // The scratch directory's own name is already unique, so it is the run's name too — no randomness
+    // needed, and Burxt has no `Math.random` to reach for anyway.
+    let slash: Int = string_rfind(scratch, "/");
+    let name: String = "comet-run-" + substring(scratch, slash + 1, len(scratch) - slash - 1);
+
+    // `--non-persistent` is the isolation guarantee: no filesystem is restored into this session and
+    // none is snapshotted out of it, so one visitor's run cannot leave anything for the next.
+    let made: Capture = os_capture_status("vercel sandbox create --name " + quoted(name)
+        + " --snapshot " + quoted(reference)
+        + " --network-policy deny-all --non-persistent"
+        + " --timeout " + to_string(seconds) + "s --vcpus " + to_string(d.vcpus)
+        + " --silent 2>&1");
+    if made.code != 0 {
+        return Outcome { ok: false, stdout: "", stderr: "", exit: 0 - 1, ms: 0, timed_out: false,
+            why: "vercel sandbox create failed: " + string_trim(made.output + made.errors) };
+    }
+
+    let copied: Capture = os_capture_status("vercel sandbox copy "
+        + quoted(work + "/" + d.file) + " " + quoted(name + ":/work/" + d.file) + " 2>&1");
+    if copied.code != 0 {
+        let gone: Capture = os_capture_status("vercel sandbox remove " + quoted(name) + " 2>&1");
+        return Outcome { ok: false, stdout: "", stderr: "", exit: 0 - 1, ms: 0, timed_out: false,
+            why: "copying the source in failed: " + string_trim(copied.output + copied.errors) };
+    }
+
+    // **Unverified against the real service**, and said out loud rather than assumed: whether
+    // `vercel sandbox exec` propagates the command's exit code is not documented, and there is no token
+    // on this machine to find out with. If it does not, this needs the exit code written to a file
+    // inside the sandbox and read back — the shape `timed` already uses. The local backend is what the
+    // checks run against until a token exists.
+    let command: String = "timeout " + to_string(seconds + 5) + "s vercel sandbox exec "
+        + quoted(name) + " -w /work -- " + joined(d.argv);
+    let result: Timed = timed(command, scratch);
+    let gone: Capture = os_capture_status("vercel sandbox remove " + quoted(name) + " 2>&1");
+
+    let killed: Bool = result.exit == 124;
+    let mutable why: String = "";
+    if killed {
+        why = "killed at the " + to_string(seconds) + "s deadline";
+    }
+    return Outcome { ok: !killed, stdout: result.stdout, stderr: result.stderr,
+        exit: result.exit, ms: result.ms, timed_out: killed, why: why };
+}
+
+// The whole of a run: a private directory, the visitor's source in it, the backend, and the answer.
+function run_source(d: Declaration, reference: String, source: String) -> Outcome
+        allocates touches commands, files, input {
+    if !d.ok {
+        return Outcome { ok: false, stdout: "", stderr: "", exit: 0 - 1, ms: 0, timed_out: false,
+            why: d.why };
+    }
+    let which: String = backend();
+    if which != "docker" && which != "vercel" {
+        return Outcome { ok: false, stdout: "", stderr: "", exit: 0 - 1, ms: 0, timed_out: false,
+            why: "no sandbox backend, so nothing ran. This refuses rather than reporting an empty run"
+                + " as a successful one" };
+    }
+
+    match file_temp_directory("comet-run") {
+        None => {
+            return Outcome { ok: false, stdout: "", stderr: "", exit: 0 - 1, ms: 0, timed_out: false,
+                why: "cannot make a private directory for this run" };
+        }
+        Some(scratch) => {
+            // **A fresh directory per run is the isolation between runs**, and it is why the source
+            // never shares a path with anything: two visitors cannot see each other even by accident.
+            let work: String = scratch + "/work";
+            // **0777, and it is not a hole.** With `--cap-drop ALL` the container's root loses
+            // `CAP_DAC_OVERRIDE`, so it faces ordinary permission checks against a directory the HOST
+            // owns — uid 1000, mode 755 — and `file_write` failed with `cannot open file for writing`.
+            // That reads like a broken mount and is a dropped capability; the alternative was
+            // `--cap-add DAC_OVERRIDE`, which weakens every run to fix one directory.
+            //
+            // The parent is what makes this safe: `file_temp_directory` creates it 0700, so nothing on
+            // the machine can traverse into this run's directory at all, and it is deleted afterwards.
+            let made: Capture = os_capture_status(
+                "mkdir -p " + quoted(work) + " && chmod 0777 " + quoted(work));
+            let wrote: Int = file_write(work + "/" + d.file, source);
+            if made.code != 0 || wrote < 0 {
+                return Outcome { ok: false, stdout: "", stderr: "", exit: 0 - 1, ms: 0,
+                    timed_out: false, why: "cannot stage the source for this run" };
+            }
+            if which == "docker" {
+                return run_docker(d, reference, work, scratch);
+            }
+            return run_vercel(d, reference, work, scratch);
+        }
+    }
+}
